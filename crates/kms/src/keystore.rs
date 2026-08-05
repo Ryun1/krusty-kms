@@ -15,6 +15,12 @@ use crate::encryption::{decrypt_with_key, encrypt_with_key};
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 
+/// Derived-key length required by the Web3 Secret Storage v3 format.
+const V3_DKLEN: usize = 32;
+
+/// AES-128-CTR IV length required by the Web3 Secret Storage v3 format.
+const V3_IV_LEN: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Native keystore (version 1)
 // ---------------------------------------------------------------------------
@@ -120,6 +126,9 @@ pub fn decrypt_keystore(keystore_json: &str, password: &str) -> Result<String> {
     )
     .map_err(|e| KmsError::DeserializationError(format!("Invalid ciphertext hex: {e}")))?;
 
+    // Validate before deriving
+    crate::encryption::xnonce(&nonce)?;
+
     // Derive key
     let mut key = derive_scrypt_key(password.as_bytes(), &salt, n)?;
 
@@ -212,6 +221,13 @@ pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<St
         .ok_or_else(|| KmsError::DeserializationError("Missing kdfparams.dklen".to_string()))?
         as usize;
 
+    // Only `dklen < 32` is unsafe: it puts the MAC key slice out of bounds.
+    if dklen < V3_DKLEN {
+        return Err(KmsError::DeserializationError(format!(
+            "Unsupported kdfparams.dklen: {dklen} (must be at least {V3_DKLEN})"
+        )));
+    }
+
     // Parse cipher params
     let iv =
         hex::decode(crypto["cipherparams"]["iv"].as_str().ok_or_else(|| {
@@ -233,6 +249,13 @@ pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<St
     )
     .map_err(|e| KmsError::DeserializationError(format!("Invalid mac hex: {e}")))?;
 
+    if iv.len() != V3_IV_LEN {
+        return Err(KmsError::DeserializationError(format!(
+            "Invalid cipherparams.iv length: expected {V3_IV_LEN} bytes, got {}",
+            iv.len()
+        )));
+    }
+
     // Derive key via scrypt
     let log_n = (n as f64).log2() as u8;
     let params = ScryptParams::new(log_n, r, p, dklen)
@@ -241,9 +264,12 @@ pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<St
     scrypt(password.as_bytes(), &salt, &params, &mut derived_key)
         .map_err(|e| KmsError::CryptoError(format!("Scrypt KDF failed: {e}")))?;
 
-    // Verify MAC: Keccak256(derived_key[16..32] || ciphertext)
-    let mut mac_input = Vec::with_capacity(16 + ciphertext.len());
-    mac_input.extend_from_slice(&derived_key[16..32]);
+    let aes_key = &derived_key[..V3_DKLEN / 2];
+    let mac_key = &derived_key[V3_DKLEN / 2..V3_DKLEN];
+
+    // Verify MAC: Keccak256(mac_key || ciphertext)
+    let mut mac_input = Vec::with_capacity(mac_key.len() + ciphertext.len());
+    mac_input.extend_from_slice(mac_key);
     mac_input.extend_from_slice(&ciphertext);
     let computed_mac = Keccak256::digest(&mac_input);
 
@@ -254,8 +280,7 @@ pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<St
         ));
     }
 
-    // Decrypt with AES-128-CTR using derived_key[0..16] as key
-    let aes_key = &derived_key[..16];
+    // Decrypt with AES-128-CTR using the first 16 bytes of the derived key
     let mut cipher = Aes128Ctr::new(aes_key.into(), iv.as_slice().into());
     cipher.apply_keystream(&mut ciphertext);
     // ciphertext is now plaintext
@@ -321,6 +346,108 @@ mod tests {
         let wrong_password = test_password(1);
         let result = decrypt_keystore(&keystore_json, &wrong_password);
         assert!(result.is_err());
+    }
+
+    // malformed keystore metadata must not panic
+
+    /// Build a v1 keystore with an arbitrary `nonce`, bypassing `encrypt_keystore`.
+    fn keystore_v1_with_nonce_hex(nonce_hex: &str) -> String {
+        serde_json::json!({
+            "version": 1,
+            "crypto": {
+                "cipher": "xchacha20-poly1305",
+                "kdf": "scrypt",
+                "kdfparams": {
+                    "n": TEST_SCRYPT_N, "r": 8, "p": 1, "dklen": 32,
+                    "salt": hex::encode([0xabu8; 16]),
+                },
+                "nonce": nonce_hex,
+                "ciphertext": hex::encode([0x11u8; 48]),
+            }
+        })
+        .to_string()
+    }
+
+    /// Build a v3 keystore with an arbitrary `dklen` and IV length.
+    fn ethers_keystore_with(dklen: u64, iv_len: usize) -> String {
+        serde_json::json!({
+            "version": 3,
+            "crypto": {
+                "cipher": "aes-128-ctr",
+                "kdf": "scrypt",
+                "kdfparams": {
+                    "n": TEST_SCRYPT_N, "r": 8, "p": 1, "dklen": dklen,
+                    "salt": hex::encode([0xabu8; 32]),
+                },
+                "cipherparams": { "iv": hex::encode(vec![0xcdu8; iv_len]) },
+                "ciphertext": hex::encode([0x11u8; 32]),
+                "mac": "00",
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn decrypt_keystore_rejects_bad_nonce_length_without_panicking() {
+        // 4 bytes instead of 24 used to hit an assert inside `generic-array`.
+        for nonce_hex in ["", "deadbeef", &hex::encode([0u8; 25])] {
+            assert!(
+                decrypt_keystore(&keystore_v1_with_nonce_hex(nonce_hex), "password1234").is_err(),
+                "nonce {nonce_hex:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_ethers_keystore_rejects_short_dklen_without_panicking() {
+        // 10..=31 is the exact panic window: scrypt allows 10..=64, but anything
+        // under 32 makes `derived_key[16..32]` go out of bounds.
+        for dklen in [10u64, 15, 16, 17, 31] {
+            let err = decrypt_ethers_keystore(&ethers_keystore_with(dklen, 16), "password1234")
+                .expect_err("must be rejected");
+            assert!(
+                matches!(err, KmsError::DeserializationError(_)),
+                "dklen={dklen}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_ethers_keystore_accepts_oversized_dklen() {
+        // 33..=64 never panicked - the slices stay in bounds and the extra
+        // bytes are ignored, which is what geth and ethers do.
+        for dklen in [33u64, 48, 64] {
+            let err = decrypt_ethers_keystore(&ethers_keystore_with(dklen, 16), "password1234")
+                .expect_err("MAC must fail");
+            assert!(
+                format!("{err}").contains("MAC verification failed"),
+                "dklen={dklen}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_ethers_keystore_rejects_bad_iv_length_without_panicking() {
+        // `Aes128Ctr::new` converts the IV with `GenericArray::from_slice`,
+        // which asserts on a length mismatch.
+        for iv_len in [0usize, 8, 15, 17, 32] {
+            assert!(
+                decrypt_ethers_keystore(&ethers_keystore_with(32, iv_len), "password1234").is_err(),
+                "iv_len={iv_len} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_dklen_and_iv_reach_mac_verification() {
+        // Guards against over-tightening: dklen=32 with a 16-byte IV must get
+        // past the new length checks and fail on the MAC instead.
+        let err = decrypt_ethers_keystore(&ethers_keystore_with(32, 16), "password1234")
+            .expect_err("MAC must fail");
+        assert!(
+            format!("{err}").contains("MAC verification failed"),
+            "got {err}"
+        );
     }
 
     #[test]
