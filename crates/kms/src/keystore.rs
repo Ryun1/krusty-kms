@@ -452,11 +452,16 @@ mod tests {
 
     #[test]
     fn decrypt_ethers_keystore_known_vector() {
-        // Build a test keystore by manually encrypting a known private key
-        // using the ethers.js format (AES-128-CTR + scrypt).
-        let private_key_bytes =
-            hex::decode("4c0883a69102937d6231471b5dbb6204fe512961708279f696ae35e0c2a1b5ce")
-                .unwrap();
+        let decrypted =
+            decrypt_ethers_keystore(&valid_ethers_keystore(32), &test_password(0)).unwrap();
+        assert_eq!(decrypted, KNOWN_PRIVATE_KEY);
+    }
+
+    const KNOWN_PRIVATE_KEY: &str =
+        "4c0883a69102937d6231471b5dbb6204fe512961708279f696ae35e0c2a1b5ce";
+
+    /// Build a valid v3 keystore holding [`KNOWN_PRIVATE_KEY`], for a given `dklen`.
+    fn valid_ethers_keystore(dklen: usize) -> String {
         let password = test_password(0);
         // Deterministic salt and IV for the test vector
         let salt = vec![0xab; 32];
@@ -464,13 +469,13 @@ mod tests {
 
         // Derive key
         let log_n = (TEST_SCRYPT_N as f64).log2() as u8;
-        let params = ScryptParams::new(log_n, 8, 1, 32).unwrap();
-        let mut derived_key = vec![0u8; 32];
+        let params = ScryptParams::new(log_n, 8, 1, dklen).unwrap();
+        let mut derived_key = vec![0u8; dklen];
         scrypt(password.as_bytes(), &salt, &params, &mut derived_key).unwrap();
 
         // Encrypt with AES-128-CTR
         let aes_key = &derived_key[..16];
-        let mut ciphertext = private_key_bytes.clone();
+        let mut ciphertext = hex::decode(KNOWN_PRIVATE_KEY).unwrap();
         let mut cipher = Aes128Ctr::new(aes_key.into(), iv.as_slice().into());
         cipher.apply_keystream(&mut ciphertext);
 
@@ -480,8 +485,7 @@ mod tests {
         mac_input.extend_from_slice(&ciphertext);
         let mac = Keccak256::digest(&mac_input);
 
-        // Build keystore JSON
-        let keystore = serde_json::json!({
+        serde_json::json!({
             "version": 3,
             "crypto": {
                 "cipher": "aes-128-ctr",
@@ -490,7 +494,7 @@ mod tests {
                     "n": TEST_SCRYPT_N,
                     "r": 8,
                     "p": 1,
-                    "dklen": 32,
+                    "dklen": dklen,
                     "salt": hex::encode(&salt),
                 },
                 "cipherparams": {
@@ -499,16 +503,20 @@ mod tests {
                 "ciphertext": hex::encode(&ciphertext),
                 "mac": hex::encode(mac.as_slice()),
             }
-        });
+        })
+        .to_string()
+    }
 
-        let keystore_json = serde_json::to_string(&keystore).unwrap();
-
-        // Decrypt and verify
-        let decrypted = decrypt_ethers_keystore(&keystore_json, &password).unwrap();
-        assert_eq!(
-            decrypted,
-            "4c0883a69102937d6231471b5dbb6204fe512961708279f696ae35e0c2a1b5ce"
-        );
+    #[test]
+    fn decrypt_ethers_keystore_oversized_dklen_yields_the_same_key() {
+        // `dklen > 32` is accepted for geth/ethers compatibility, so it must
+        // decrypt *correctly*, not merely get past the length check: the tail
+        // beyond 32 bytes is ignored and the recovered key is unchanged.
+        for dklen in [33usize, 48, 64] {
+            let got = decrypt_ethers_keystore(&valid_ethers_keystore(dklen), &test_password(0))
+                .unwrap_or_else(|e| panic!("dklen={dklen} must decrypt, got {e}"));
+            assert_eq!(got, KNOWN_PRIVATE_KEY, "dklen={dklen} changed the key");
+        }
     }
 
     #[test]
