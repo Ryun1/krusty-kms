@@ -50,9 +50,24 @@ pub struct EncryptedPayload {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Convert a scrypt cost parameter `n` into the `log2(n)` form scrypt takes.
+///
+/// Rejects non-powers-of-two instead of flooring them: `(100000f64).log2() as u8`
+/// is 16, silently deriving with N=65536. Rejects `n > u32::MAX` before a cast
+/// can truncate it into a valid-looking power of two.
+pub(crate) fn scrypt_log_n(n: u64) -> Result<u8> {
+    if !n.is_power_of_two() || n > u32::MAX as u64 {
+        return Err(KmsError::DeserializationError(format!(
+            "Unsupported scrypt n: {n} (must be a power of two, at most {})",
+            u32::MAX
+        )));
+    }
+    Ok(n.trailing_zeros() as u8)
+}
+
 /// Derive a 32-byte key from a password and salt using scrypt.
 fn derive_scrypt_key(password: &[u8], kdf_salt: &[u8], n: u32) -> Result<[u8; 32]> {
-    let log_n = (n as f64).log2() as u8;
+    let log_n = scrypt_log_n(n as u64)?;
     let params = ScryptParams::new(log_n, 8, 1, 32)
         .map_err(|e| KmsError::CryptoError(format!("Invalid scrypt params: {e}")))?;
     let mut key = [u8::default(); 32];

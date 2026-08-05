@@ -11,7 +11,7 @@ use scrypt::{scrypt, Params as ScryptParams};
 use sha3::{Digest, Keccak256};
 use zeroize::Zeroize;
 
-use crate::encryption::{decrypt_with_key, encrypt_with_key};
+use crate::encryption::{decrypt_with_key, encrypt_with_key, scrypt_log_n};
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 
@@ -109,8 +109,11 @@ pub fn decrypt_keystore(keystore_json: &str, password: &str) -> Result<String> {
 
     let n = crypto["kdfparams"]["n"]
         .as_u64()
-        .ok_or_else(|| KmsError::DeserializationError("Missing kdfparams.n".to_string()))?
-        as u32;
+        .ok_or_else(|| KmsError::DeserializationError("Missing kdfparams.n".to_string()))?;
+
+    // Before the cast, which would truncate 2^32 + 1024 to 1024.
+    scrypt_log_n(n)?;
+    let n = n as u32;
 
     let nonce = hex::decode(
         crypto["nonce"]
@@ -203,8 +206,7 @@ pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<St
 
     let n = crypto["kdfparams"]["n"]
         .as_u64()
-        .ok_or_else(|| KmsError::DeserializationError("Missing kdfparams.n".to_string()))?
-        as u32;
+        .ok_or_else(|| KmsError::DeserializationError("Missing kdfparams.n".to_string()))?;
 
     let r = crypto["kdfparams"]["r"]
         .as_u64()
@@ -257,7 +259,7 @@ pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<St
     }
 
     // Derive key via scrypt
-    let log_n = (n as f64).log2() as u8;
+    let log_n = scrypt_log_n(n)?;
     let params = ScryptParams::new(log_n, r, p, dklen)
         .map_err(|e| KmsError::CryptoError(format!("Invalid scrypt params: {e}")))?;
     let mut derived_key = vec![0u8; dklen];
@@ -297,7 +299,7 @@ pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<St
 
 /// Derive a 32-byte key from a password and salt using scrypt (r=8, p=1).
 fn derive_scrypt_key(password: &[u8], kdf_salt: &[u8], n: u32) -> Result<[u8; 32]> {
-    let log_n = (n as f64).log2() as u8;
+    let log_n = scrypt_log_n(n as u64)?;
     let params = ScryptParams::new(log_n, 8, 1, 32)
         .map_err(|e| KmsError::CryptoError(format!("Invalid scrypt params: {e}")))?;
     let mut key = [u8::default(); 32];
@@ -505,6 +507,58 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    /// `n` values that must be refused rather than silently floored or truncated.
+    ///
+    /// All kept small: an `n` big enough to exhaust memory aborts the test
+    /// process instead of failing a case, and that guard is not in place.
+    const BAD_SCRYPT_N: [u64; 4] = [
+        1000,             // floored to 512
+        100_000,          // floored to 65536, a weaker KDF
+        0,                // log2(0) is -inf
+        (1 << 32) + 1024, // truncated to 1024 by `as u32`
+    ];
+
+    #[test]
+    fn decrypt_ethers_keystore_rejects_non_power_of_two_n() {
+        for n in BAD_SCRYPT_N {
+            let mut ks: serde_json::Value =
+                serde_json::from_str(&valid_ethers_keystore(32)).unwrap();
+            ks["crypto"]["kdfparams"]["n"] = serde_json::json!(n);
+            let err = decrypt_ethers_keystore(&ks.to_string(), &test_password(0))
+                .expect_err("must be rejected");
+            assert!(
+                matches!(err, KmsError::DeserializationError(_)),
+                "n={n}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_keystore_rejects_non_power_of_two_n() {
+        // Same guard on the v1 path, which also takes `n` from untrusted JSON.
+        for n in BAD_SCRYPT_N {
+            let mut ks: serde_json::Value =
+                serde_json::from_str(&keystore_v1_with_nonce_hex(&hex::encode([0u8; 24]))).unwrap();
+            ks["crypto"]["kdfparams"]["n"] = serde_json::json!(n);
+            assert!(
+                decrypt_keystore(&ks.to_string(), "password1234").is_err(),
+                "n={n} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypt_keystore_rejects_non_power_of_two_n() {
+        // Matters most here: flooring weakens the KDF the caller asked for.
+        for n in BAD_SCRYPT_N {
+            let Ok(n) = u32::try_from(n) else { continue };
+            assert!(
+                encrypt_keystore("test mnemonic", "password1234", n).is_err(),
+                "n={n} must be rejected"
+            );
+        }
     }
 
     #[test]
