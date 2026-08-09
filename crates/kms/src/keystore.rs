@@ -51,6 +51,49 @@ fn check_size(keystore_json: &str) -> Result<()> {
     Ok(())
 }
 
+/// Render an untrusted JSON value for an error message, bounded.
+///
+/// Bounds the *work*, not just the result. Discriminating on the kind is the point:
+/// `Display` on a `Value` serializes the whole subtree and on a string copies all of
+/// it, so `"cipher": {"a": <10 MB>}` would allocate 10 MB to build a 40-char message
+/// -- and these get logged. Numbers, booleans and null are bounded by their syntax.
+fn brief(value: &serde_json::Value) -> String {
+    const MAX: usize = 40;
+    let text = match value {
+        serde_json::Value::Object(_) => return "an object".to_string(),
+        serde_json::Value::Array(_) => return "an array".to_string(),
+        serde_json::Value::String(text) => text.as_str(),
+        scalar => return scalar.to_string(),
+    };
+    // Slice before allocating, so a 10 MB string is never copied.
+    match text.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("\"{}\"...", &text[..cut]),
+        None => format!("\"{text}\""),
+    }
+}
+
+/// Require a field to hold an exact string, with a bounded error message.
+///
+/// Both formats do this check and writing it per-site is what left the v3 `kdf` arm
+/// interpolating an untrusted string straight into the message while its `cipher`
+/// neighbour went through [`brief`]. Absence is a mismatch, not a default: the value
+/// is what the decrypt path assumes unconditionally.
+fn require_str(
+    parent: &serde_json::Value,
+    field: &str,
+    expected: &str,
+    format: &str,
+) -> Result<()> {
+    let got = &parent[field];
+    if got.as_str() != Some(expected) {
+        return Err(KmsError::DeserializationError(format!(
+            "Unsupported {field}: {} ({format} requires {expected})",
+            brief(got)
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Native keystore (version 1)
 // ---------------------------------------------------------------------------
@@ -138,6 +181,15 @@ pub fn decrypt_keystore(keystore_json: &str, password: &str) -> Result<String> {
 
     let crypto = &v["crypto"];
 
+    // Same reasoning as `kdfparams` below, and as the v3 path: this derives with
+    // scrypt and decrypts with XChaCha20-Poly1305 unconditionally, so a file naming
+    // anything else produces a wrong key reported as a wrong password. Required, not
+    // absent-tolerant: `encrypt_keystore` has always written both, so a file missing
+    // one is not a v1 keystore and guessing what it is has no upside.
+    for (field, expected) in [("kdf", "scrypt"), ("cipher", "xchacha20-poly1305")] {
+        require_str(crypto, field, expected, "version 1")?;
+    }
+
     let kdfparams = &crypto["kdfparams"];
 
     let salt = hex::decode(
@@ -150,6 +202,20 @@ pub fn decrypt_keystore(keystore_json: &str, password: &str) -> Result<String> {
     let n = kdfparams["n"]
         .as_u64()
         .ok_or_else(|| KmsError::DeserializationError("Missing kdfparams.n".to_string()))?;
+
+    // v1 only ever wrote these and always derives with them, so a file claiming
+    // otherwise would decrypt to the wrong key and blame the password. Required rather
+    // than defaulted: `as_u64().unwrap_or(expected)` would wave through `"8"`, `8.0`
+    // and `-1` alongside genuine absence, which is the mismatch this is here to catch.
+    for (field, expected) in [("r", 8u64), ("p", 1), ("dklen", 32)] {
+        let got = &kdfparams[field];
+        if got.as_u64() != Some(expected) {
+            return Err(KmsError::DeserializationError(format!(
+                "Unsupported kdfparams.{field}: {} (version 1 requires {expected})",
+                brief(got)
+            )));
+        }
+    }
 
     let nonce = hex::decode(
         crypto["nonce"]
@@ -229,14 +295,18 @@ pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<St
 
     let crypto = &v["crypto"];
 
-    let kdf = crypto["kdf"]
-        .as_str()
-        .ok_or_else(|| KmsError::DeserializationError("Missing kdf field".to_string()))?;
-    if kdf != "scrypt" {
-        return Err(KmsError::DeserializationError(format!(
-            "Unsupported KDF: {kdf} (only scrypt is supported)"
-        )));
-    }
+    require_str(crypto, "kdf", "scrypt", "version 3")?;
+
+    // The MAC covers `mac_key || ciphertext`, not the cipher id, so an unchecked
+    // `cipher` verifies and is then decrypted as AES-128-CTR regardless, returning
+    // garbage as an imported private key.
+    //
+    // Required, not absent-tolerant like the v1 header: v1 decrypts with an AEAD, so
+    // the wrong cipher fails authentication loudly, while CTR has nothing but this
+    // MAC and would hand back a silently wrong key. Stripping the field from a real
+    // aes-256-ctr keystore is enough to trigger that. The format mandates `cipher`
+    // and geth and ethers both emit it, so nothing legitimate is stranded.
+    require_str(crypto, "cipher", "aes-128-ctr", "version 3")?;
 
     // Parse kdfparams
     let kdfparams = &crypto["kdfparams"];
@@ -491,6 +561,56 @@ mod tests {
     }
 
     #[test]
+    fn brief_bounds_the_error_message_for_any_value_kind() {
+        // A huge value must not become a huge error string. Every string-compared
+        // field, not just `cipher`: `kdf` used to interpolate the raw value and was
+        // the one arm this test did not reach.
+        let huge = "a".repeat(MAX_KEYSTORE_BYTES / 2);
+        for field in ["cipher", "kdf"] {
+            for value in [
+                serde_json::json!({ "nested": huge }),
+                serde_json::json!([huge]),
+                serde_json::json!(huge),
+            ] {
+                let mut ks: serde_json::Value =
+                    serde_json::from_str(&valid_ethers_keystore(32)).unwrap();
+                ks["crypto"][field] = value;
+                let json = ks.to_string();
+                assert!(json.len() <= MAX_KEYSTORE_BYTES, "fixture hit the size cap");
+
+                let err = decrypt_ethers_keystore(&json, &test_password(0))
+                    .expect_err("must be rejected");
+                let message = format!("{err}");
+                assert!(
+                    message.len() < 200,
+                    "unbounded {field} message: {} bytes",
+                    message.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v3_reports_a_present_but_non_string_kdf_as_unsupported_not_missing() {
+        // `.as_str().ok_or("Missing kdf field")` told the user a field they can plainly
+        // see is absent. Absence and wrong-type are both "unsupported" now.
+        for value in [
+            serde_json::json!(5),
+            serde_json::json!({ "name": "scrypt" }),
+        ] {
+            let mut ks: serde_json::Value =
+                serde_json::from_str(&valid_ethers_keystore(32)).unwrap();
+            ks["crypto"]["kdf"] = value.clone();
+            let err = decrypt_ethers_keystore(&ks.to_string(), &test_password(0))
+                .expect_err("must be rejected");
+            assert!(
+                format!("{err}").contains("Unsupported kdf"),
+                "kdf={value}, got {err}"
+            );
+        }
+    }
+
+    #[test]
     fn a_file_sourced_nonce_length_is_a_malformed_keystore_not_a_crypto_error() {
         // `CryptoError` is what a wrong password returns, so reporting a bad nonce that
         // way sends the caller round a password retry loop for a file that can never
@@ -668,6 +788,88 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_keystore_rejects_mismatched_kdfparams() {
+        // v1 always derives with r=8, p=1, dklen=32. A file claiming otherwise would
+        // decrypt to the wrong key and surface as a password failure. A wrong-typed
+        // value counts, not just a wrong number -- `"8"`, `8.0` and `-1` are the cases
+        // an `unwrap_or(8)` would have waved through.
+        let cases = [
+            ("r", serde_json::json!(16u64)),
+            ("p", serde_json::json!(2)),
+            ("dklen", serde_json::json!(64)),
+            ("r", serde_json::json!("16")),
+            ("r", serde_json::json!(16.0)),
+            ("r", serde_json::json!(-1)),
+            ("p", serde_json::json!("1")),
+            ("dklen", serde_json::json!(true)),
+        ];
+        for (field, value) in cases {
+            let keystore = encrypt_keystore("m", "password1234", TEST_SCRYPT_N).unwrap();
+            let mut ks: serde_json::Value = serde_json::from_str(&keystore).unwrap();
+            ks["crypto"]["kdfparams"][field] = value.clone();
+            let err =
+                decrypt_keystore(&ks.to_string(), "password1234").expect_err("must be rejected");
+            assert!(
+                format!("{err}").contains(&format!("kdfparams.{field}")),
+                "{field}={value}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_keystore_rejects_mismatched_kdf_and_cipher() {
+        // v1 derives with scrypt and decrypts with XChaCha20-Poly1305 unconditionally,
+        // so a file naming anything else fails in the AEAD and reads as a wrong
+        // password. Same failure the kdfparams check above exists to prevent.
+        for (field, value) in [("kdf", "pbkdf2"), ("cipher", "aes-128-ctr")] {
+            let keystore = encrypt_keystore("m", "password1234", TEST_SCRYPT_N).unwrap();
+            let mut ks: serde_json::Value = serde_json::from_str(&keystore).unwrap();
+            ks["crypto"][field] = serde_json::json!(value);
+            let err =
+                decrypt_keystore(&ks.to_string(), "password1234").expect_err("must be rejected");
+            assert!(
+                format!("{err}").contains(&format!("Unsupported {field}")),
+                "{field}={value}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_keystore_requires_kdf_and_cipher() {
+        // Absence is a rejection, not a default: `encrypt_keystore` has always written
+        // both, so a file missing one is not a v1 keystore.
+        for field in ["kdf", "cipher"] {
+            let keystore = encrypt_keystore("m", "password1234", TEST_SCRYPT_N).unwrap();
+            let mut ks: serde_json::Value = serde_json::from_str(&keystore).unwrap();
+            ks["crypto"].as_object_mut().unwrap().remove(field);
+            let err =
+                decrypt_keystore(&ks.to_string(), "password1234").expect_err("must be rejected");
+            assert!(
+                format!("{err}").contains(&format!("Unsupported {field}")),
+                "absent {field}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_keystore_requires_kdfparams() {
+        for field in ["r", "p", "dklen"] {
+            let keystore = encrypt_keystore("m", "password1234", TEST_SCRYPT_N).unwrap();
+            let mut ks: serde_json::Value = serde_json::from_str(&keystore).unwrap();
+            ks["crypto"]["kdfparams"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let err =
+                decrypt_keystore(&ks.to_string(), "password1234").expect_err("must be rejected");
+            assert!(
+                format!("{err}").contains(&format!("kdfparams.{field}")),
+                "absent {field}, got {err}"
+            );
+        }
+    }
+
+    #[test]
     fn decrypt_keystore_rejects_unusable_n() {
         for n in BAD_SCRYPT_N_DECRYPT {
             let mut ks: serde_json::Value =
@@ -695,6 +897,41 @@ mod tests {
                 "n={n}, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn decrypt_ethers_keystore_rejects_wrong_cipher() {
+        // A non-string is a mismatch too, not an absent field.
+        for cipher in [
+            serde_json::json!("aes-256-ctr"),
+            serde_json::json!("aes-128-cbc"),
+            serde_json::json!(""),
+            serde_json::json!("AES-128-CTR"),
+            serde_json::json!(128),
+        ] {
+            let mut ks: serde_json::Value =
+                serde_json::from_str(&valid_ethers_keystore(32)).unwrap();
+            ks["crypto"]["cipher"] = cipher.clone();
+            let err = decrypt_ethers_keystore(&ks.to_string(), &test_password(0))
+                .expect_err("must be rejected");
+            assert!(
+                matches!(err, KmsError::DeserializationError(_)),
+                "cipher={cipher}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_ethers_keystore_requires_cipher() {
+        // Absence is not tolerated here, unlike the v1 header. A real aes-256-ctr
+        // keystore with the field stripped still MAC-verifies -- the MAC does not
+        // cover the cipher id -- and would decrypt as AES-128-CTR into a silently
+        // wrong private key. v1 cannot fail this way: its AEAD authenticates.
+        let mut ks: serde_json::Value = serde_json::from_str(&valid_ethers_keystore(32)).unwrap();
+        ks["crypto"].as_object_mut().unwrap().remove("cipher");
+        let err = decrypt_ethers_keystore(&ks.to_string(), &test_password(0))
+            .expect_err("absent cipher must be rejected");
+        assert!(format!("{err}").contains("Unsupported cipher"), "got {err}");
     }
 
     #[test]
