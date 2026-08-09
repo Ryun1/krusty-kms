@@ -13,32 +13,32 @@ use scrypt::{scrypt, Params as ScryptParams};
 use zeroize::Zeroizing;
 
 /// XChaCha20-Poly1305 extended nonce length, in bytes.
-pub(crate) const XNONCE_LEN: usize = 24;
+pub const XNONCE_LEN: usize = 24;
 
-/// Validate a nonce length before it reaches the AEAD.
+/// Convert untrusted bytes into a nonce, or reject them.
 ///
-/// `XNonce::from_slice` asserts on a mismatch rather than erroring, so a nonce taken
-/// from untrusted JSON aborted the process instead of returning.
-///
-/// `DeserializationError` rather than `CryptoError`: the length is a property of the
-/// stored file, not of the password, and the two are the same variant to a caller who
-/// only sees the error code. `CryptoError` maps to `CRYPTO_ERROR` in the wasm layer,
-/// which reads as "wrong password" and invites a retry that cannot succeed.
-pub(crate) fn xnonce(nonce: &[u8]) -> Result<&XNonce> {
-    if nonce.len() != XNONCE_LEN {
-        return Err(KmsError::DeserializationError(format!(
+/// The way to build the `nonce` field on [`EncryptedKey`] and [`EncryptedPayload`]
+/// from a decoded hex string. Length is checked here, at the parse boundary, so it
+/// cannot reach [`XNonce::from_slice`] -- which asserts rather than erroring, and was
+/// the original panic. Everything downstream holds a fixed-size array and needs no
+/// guard of its own.
+pub fn xnonce(bytes: &[u8]) -> Result<[u8; XNONCE_LEN]> {
+    bytes.try_into().map_err(|_| {
+        KmsError::DeserializationError(format!(
             "Invalid nonce length: expected {XNONCE_LEN} bytes, got {}",
-            nonce.len()
-        )));
-    }
-    Ok(XNonce::from_slice(nonce))
+            bytes.len()
+        ))
+    })
 }
 
 /// Encrypted private key with KDF salt.
+///
+/// The nonce is a fixed-size array rather than a `Vec`, so a wrong length is
+/// unrepresentable instead of being caught by a guard at each point of use.
 #[derive(Debug, Clone)]
 pub struct EncryptedKey {
-    /// 24-byte XChaCha20 nonce.
-    pub nonce: Vec<u8>,
+    /// 24-byte XChaCha20 nonce. Build from untrusted bytes with [`xnonce`].
+    pub nonce: [u8; XNONCE_LEN],
     /// 16-byte scrypt salt.
     pub salt: Vec<u8>,
     /// Ciphertext with 16-byte Poly1305 authentication tag appended.
@@ -48,8 +48,8 @@ pub struct EncryptedKey {
 /// Encrypted payload (no KDF metadata -- caller provides key directly).
 #[derive(Debug, Clone)]
 pub struct EncryptedPayload {
-    /// 24-byte XChaCha20 nonce.
-    pub nonce: Vec<u8>,
+    /// 24-byte XChaCha20 nonce. Build from untrusted bytes with [`xnonce`].
+    pub nonce: [u8; XNONCE_LEN],
     /// Ciphertext with 16-byte Poly1305 authentication tag appended.
     pub ciphertext: Vec<u8>,
 }
@@ -280,7 +280,7 @@ pub fn encrypt_private_key(
         .map_err(|e| KmsError::CryptoError(format!("Encryption failed: {e}")))?;
 
     Ok(EncryptedKey {
-        nonce: nonce_bytes.to_vec(),
+        nonce: nonce_bytes,
         salt: salt.to_vec(),
         encrypted_key: ciphertext,
     })
@@ -300,8 +300,7 @@ pub fn decrypt_private_key(
     password: &str,
     scrypt_n: u32,
 ) -> Result<String> {
-    // Validate before deriving, so a malformed nonce costs no KDF work.
-    let nonce = xnonce(&encrypted.nonce)?;
+    let nonce = XNonce::from_slice(&encrypted.nonce);
 
     // `scrypt_n` is an argument here too, not read from the payload.
     let key = derive_scrypt_key(password.as_bytes(), &encrypted.salt, scrypt_n.into())
@@ -344,7 +343,7 @@ pub fn encrypt_with_key(plaintext: &[u8], key: &[u8; 32]) -> Result<EncryptedPay
         .map_err(|e| KmsError::CryptoError(format!("Encryption failed: {e}")))?;
 
     Ok(EncryptedPayload {
-        nonce: nonce_bytes.to_vec(),
+        nonce: nonce_bytes,
         ciphertext,
     })
 }
@@ -360,7 +359,7 @@ pub fn encrypt_with_key(plaintext: &[u8], key: &[u8; 32]) -> Result<EncryptedPay
 pub fn decrypt_with_key(payload: &EncryptedPayload, key: &[u8; 32]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| KmsError::CryptoError(format!("Invalid key: {e}")))?;
-    let nonce = xnonce(&payload.nonce)?;
+    let nonce = XNonce::from_slice(&payload.nonce);
     cipher
         .decrypt(nonce, payload.ciphertext.as_ref())
         .map_err(|e| KmsError::CryptoError(format!("Decryption failed: {e}")))
@@ -520,49 +519,39 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
-    // A nonce length must be validated, not asserted.
+    // A wrong nonce length is now unrepresentable -- `EncryptedPayload { nonce: vec![0;
+    // 4], .. }` does not compile -- so these test the one boundary that can still
+    // produce one, rather than each point of use.
 
     #[test]
-    fn decrypt_with_key_rejects_wrong_nonce_length_without_panicking() {
-        // `XNonce::from_slice` asserts on a length mismatch, so a nonce taken
-        // from untrusted JSON used to abort the process instead of erroring.
-        let key = test_key(0);
+    fn xnonce_rejects_wrong_lengths_without_panicking() {
+        // `XNonce::from_slice` asserts on a length mismatch, so a nonce taken from
+        // untrusted JSON used to abort the process instead of erroring. It cannot
+        // reach that call any more; this is where it stops.
         for len in [0usize, 4, 23, 25, 64] {
-            let payload = EncryptedPayload {
-                nonce: vec![0u8; len],
-                ciphertext: vec![0u8; 48],
-            };
-            let err = decrypt_with_key(&payload, &key).expect_err("must be rejected");
+            let err = xnonce(&vec![0u8; len]).expect_err("must be rejected");
             assert!(
-                format!("{err}").contains("Invalid nonce length"),
-                "len={len}, got {err}"
+                matches!(err, KmsError::DeserializationError(_)),
+                "len={len}, got {err:?}"
             );
         }
     }
 
     #[test]
-    fn decrypt_private_key_rejects_wrong_nonce_length_without_panicking() {
-        for len in [0usize, 4, 23, 25] {
-            let encrypted = EncryptedKey {
-                nonce: vec![0u8; len],
-                salt: vec![0u8; 16],
-                encrypted_key: vec![0u8; 48],
-            };
-            let err = decrypt_private_key(&encrypted, &test_password(0), TEST_SCRYPT_N)
-                .expect_err("must be rejected");
-            assert!(
-                format!("{err}").contains("Invalid nonce length"),
-                "len={len}, got {err}"
-            );
-        }
+    fn xnonce_accepts_the_correct_length() {
+        // Guards against over-tightening.
+        assert_eq!(
+            xnonce(&[7u8; XNONCE_LEN]).expect("must be accepted"),
+            [7u8; XNONCE_LEN]
+        );
     }
 
     #[test]
-    fn correct_nonce_length_is_accepted() {
-        // Guards against over-tightening: a well-formed 24-byte nonce must
-        // still reach the AEAD and fail on authentication, not on length.
+    fn a_well_formed_nonce_reaches_the_aead() {
+        // The other half of over-tightening: a valid nonce must fail on the
+        // authentication tag, not on length.
         let payload = EncryptedPayload {
-            nonce: vec![0u8; XNONCE_LEN],
+            nonce: [0u8; XNONCE_LEN],
             ciphertext: vec![0u8; 48],
         };
         let err = decrypt_with_key(&payload, &test_key(0)).expect_err("tag must fail");

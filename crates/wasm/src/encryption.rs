@@ -53,7 +53,7 @@ pub fn encrypt_private_key(
         .map_err(|e| JsValue::from(crate::error::WasmError::from(e)))?;
 
     Ok(WasmEncryptedKey {
-        nonce: hex::encode(&result.nonce),
+        nonce: hex::encode(result.nonce),
         salt: hex::encode(&result.salt),
         encrypted_key: hex::encode(&result.encrypted_key),
     })
@@ -76,8 +76,11 @@ pub fn decrypt_private_key(
     scrypt_n: u32,
 ) -> Result<String, JsValue> {
     let encrypted = EncryptedKey {
-        nonce: hex::decode(nonce)
-            .map_err(|e| JsValue::from_str(&format!("Invalid nonce hex: {e}")))?,
+        nonce: encryption::xnonce(
+            &hex::decode(nonce)
+                .map_err(|e| JsValue::from_str(&format!("Invalid nonce hex: {e}")))?,
+        )
+        .map_err(|e| JsValue::from(crate::error::WasmError::from(e)))?,
         salt: hex::decode(salt)
             .map_err(|e| JsValue::from_str(&format!("Invalid salt hex: {e}")))?,
         encrypted_key: hex::decode(encrypted_key)
@@ -112,7 +115,7 @@ pub fn encrypt_with_key(plaintext: &str, key_hex: &str) -> Result<WasmEncryptedP
         .map_err(|e| JsValue::from(crate::error::WasmError::from(e)))?;
 
     Ok(WasmEncryptedPayload {
-        nonce: hex::encode(&result.nonce),
+        nonce: hex::encode(result.nonce),
         ciphertext: hex::encode(&result.ciphertext),
     })
 }
@@ -135,8 +138,11 @@ pub fn decrypt_with_key(nonce: &str, ciphertext: &str, key_hex: &str) -> Result<
     let key: [u8; 32] = key_bytes.try_into().unwrap();
 
     let payload = EncryptedPayload {
-        nonce: hex::decode(nonce)
-            .map_err(|e| JsValue::from_str(&format!("Invalid nonce hex: {e}")))?,
+        nonce: encryption::xnonce(
+            &hex::decode(nonce)
+                .map_err(|e| JsValue::from_str(&format!("Invalid nonce hex: {e}")))?,
+        )
+        .map_err(|e| JsValue::from(crate::error::WasmError::from(e)))?,
         ciphertext: hex::decode(ciphertext)
             .map_err(|e| JsValue::from_str(&format!("Invalid ciphertext hex: {e}")))?,
     };
@@ -167,13 +173,13 @@ pub fn encrypt_keystore(mnemonic: &str, password: &str, scrypt_n: u32) -> Result
 
 /// Decrypt a krusty-kms keystore (version 1) to recover the mnemonic.
 ///
-///
 /// The KDF parameters come from the file, so rate-limit this if the keystores are
 /// untrusted: the accepted range tops out around 2 s of CPU and 264 MiB of memory,
 /// which in a browser tab means a frozen UI or a failed alloc. Inputs over 64 KiB are
 /// rejected before parsing -- but wasm-bindgen has already copied the JS string into
 /// linear memory by then, and that memory is never returned to the host, so bounding
 /// the string on the JS side is still the caller's job.
+///
 /// @param keystoreJson - JSON keystore string
 /// @param password - The password used during encryption
 /// @returns Decrypted mnemonic phrase
@@ -185,13 +191,13 @@ pub fn decrypt_keystore(keystore_json: &str, password: &str) -> Result<String, J
 
 /// Decrypt an ethers.js / Web3 Secret Storage keystore (version 3, scrypt KDF).
 ///
-///
 /// The KDF parameters come from the file, so rate-limit this if the keystores are
 /// untrusted: the accepted range tops out around 2 s of CPU and 264 MiB of memory,
 /// which in a browser tab means a frozen UI or a failed alloc. Inputs over 64 KiB are
 /// rejected before parsing -- but wasm-bindgen has already copied the JS string into
 /// linear memory by then, and that memory is never returned to the host, so bounding
 /// the string on the JS side is still the caller's job.
+///
 /// @param keystoreJson - JSON keystore string in ethers.js format
 /// @param password - The password used during encryption
 /// @returns Decrypted content as hex string (typically a private key)

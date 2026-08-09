@@ -231,9 +231,9 @@ pub fn decrypt_keystore(keystore_json: &str, password: &str) -> Result<String> {
     )
     .map_err(|e| KmsError::DeserializationError(format!("Invalid ciphertext hex: {e}")))?;
 
-    // Validated before deriving, so a malformed nonce costs nothing rather than ~2 s
-    // of scrypt first.
-    xnonce(&nonce)?;
+    // Converted before deriving, so a malformed nonce costs nothing rather than ~2 s
+    // of scrypt first. Past this point the length is carried by the type.
+    let nonce = xnonce(&nonce)?;
 
     let key = derive_scrypt_key(password.as_bytes(), &salt, n)?;
 
