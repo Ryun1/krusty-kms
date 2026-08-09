@@ -24,6 +24,15 @@ pub enum KmsError {
     #[error("Deserialization error: {0}")]
     DeserializationError(String),
 
+    /// A caller-supplied argument was rejected.
+    ///
+    /// Distinct from [`KmsError::DeserializationError`], which means untrusted *input*
+    /// was malformed: this one is the caller's own programming error, so a caller that
+    /// branches on the variant can tell "the keystore I was handed is corrupt" from
+    /// "I passed a bad argument".
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
+
     #[error("Invalid amount: {0}")]
     InvalidAmount(String),
 

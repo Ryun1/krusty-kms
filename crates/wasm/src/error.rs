@@ -25,6 +25,8 @@ pub enum WasmError {
     InsufficientBalance { available: u128, required: u128 },
     /// Invalid amount specified
     InvalidAmount(String),
+    /// A caller-supplied argument was rejected
+    InvalidParameter(String),
     /// Proof generation or verification failed
     ProofError(String),
     /// Internal SDK error
@@ -47,11 +49,21 @@ impl WasmError {
                 format!("Insufficient balance: available={available}, required={required}")
             }
             Self::InvalidAmount(s) => format!("Invalid amount: {s}"),
+            Self::InvalidParameter(s) => format!("Invalid parameter: {s}"),
             Self::ProofError(s) => format!("Proof error: {s}"),
             Self::InternalError(s) => format!("Internal error: {s}"),
         };
 
-        js_sys::Error::new(&msg).into()
+        let error = js_sys::Error::new(&msg);
+        // Attach the code, so JS can branch on it instead of matching the message.
+        // Without this `code()` has no path to the caller and every variant is
+        // distinguishable only by string, which is what it exists to avoid.
+        let _ = js_sys::Reflect::set(
+            &error,
+            &JsValue::from_str("code"),
+            &JsValue::from_str(self.code()),
+        );
+        error.into()
     }
 
     /// Error code for programmatic handling in JavaScript.
@@ -64,6 +76,7 @@ impl WasmError {
             Self::SerializationError(_) => "SERIALIZATION_ERROR",
             Self::InsufficientBalance { .. } => "INSUFFICIENT_BALANCE",
             Self::InvalidAmount(_) => "INVALID_AMOUNT",
+            Self::InvalidParameter(_) => "INVALID_PARAMETER",
             Self::ProofError(_) => "PROOF_ERROR",
             Self::InternalError(_) => "INTERNAL_ERROR",
         }
@@ -93,6 +106,10 @@ impl From<krusty_kms_common::KmsError> for WasmError {
                 required,
             },
             krusty_kms_common::KmsError::InvalidAmount(s) => Self::InvalidAmount(s),
+            // Deliberately not folded into SerializationError like DeserializationError
+            // above: JS callers are the ones passing `scryptN`, so they are exactly who
+            // needs "you passed a bad argument" separated from "the file is corrupt".
+            krusty_kms_common::KmsError::InvalidParameter(s) => Self::InvalidParameter(s),
             krusty_kms_common::KmsError::InvalidProof(s) => Self::ProofError(s),
             krusty_kms_common::KmsError::PointAtInfinity => {
                 Self::CryptoError("Point at infinity".to_string())

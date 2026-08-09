@@ -985,6 +985,7 @@ pub(crate) fn map_kms_error(error: KmsError) -> GatewayError {
         | KmsError::CryptoError(message)
         | KmsError::SerializationError(message)
         | KmsError::DeserializationError(message)
+        | KmsError::InvalidParameter(message)
         | KmsError::InvalidAmount(message)
         | KmsError::StarknetCryptoError(message)
         | KmsError::InvalidProof(message)
