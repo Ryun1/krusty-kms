@@ -7,13 +7,12 @@
 use aes::Aes128;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use krusty_kms_common::{KmsError, Result};
-use scrypt::{scrypt, Params as ScryptParams};
 use sha3::{Digest, Keccak256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::encryption::{
-    decrypt_with_key, derive_scrypt_key, encrypt_with_key, scrypt_log_n, xnonce,
+    caller_param, decrypt_with_key, derive_scrypt_key, encrypt_with_key, scrypt_derive, xnonce,
 };
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
@@ -24,59 +23,29 @@ const V3_DKLEN: usize = 32;
 /// AES-128-CTR IV length required by the Web3 Secret Storage v3 format.
 const V3_IV_LEN: usize = 16;
 
-fn parse_u32_kdf_param(value: Option<u64>, field: &str) -> Result<u32> {
-    let n = value
-        .ok_or_else(|| KmsError::DeserializationError(format!("Missing kdfparams.{field}")))?;
-    u32::try_from(n).map_err(|_| {
-        KmsError::DeserializationError(format!("kdfparams.{field} exceeds u32 range (got {n})"))
-    })
-}
+/// Largest `dklen` accepted. Matches scrypt's own limit, but keeps
+/// `vec![0u8; dklen]` off a file-chosen size if that ever changes.
+const V3_DKLEN_MAX: u64 = 64;
 
-// Checked u64 -> usize conversion: a plain `as usize` truncates on wasm32, so
-// e.g. 2^32 + 32 would become 32 and bypass the dklen ceiling below.
-fn parse_usize_kdf_param(value: Option<u64>, field: &str) -> Result<usize> {
-    let n = value
-        .ok_or_else(|| KmsError::DeserializationError(format!("Missing kdfparams.{field}")))?;
-    usize::try_from(n).map_err(|_| {
-        KmsError::DeserializationError(format!("kdfparams.{field} exceeds usize range (got {n})"))
-    })
-}
-
-/// Ethereum-keystore-compatible ceilings for attacker-controlled scrypt params.
+/// Largest keystore accepted, in bytes.
 ///
-/// Memory ≈ 128 · N · r bytes. With [`scrypt_log_n`]'s N ≤ 2^20 and r ≤ 32 that
-/// caps at ~4 GiB; we additionally reject products that would exceed 256 MiB so
-/// malicious keystores cannot turn import into a DoS.
-const SCRYPT_R_MAX: u32 = 32;
-const SCRYPT_P_MAX: u32 = 16;
-// Decryption unconditionally splits the derived key at [..16] and [16..32],
-// so anything shorter than 32 bytes would panic instead of erroring.
-const SCRYPT_DKLEN_MIN: usize = 32;
-const SCRYPT_DKLEN_MAX: usize = 64;
-const SCRYPT_MEMORY_CEILING_BYTES: u64 = 256 * 1024 * 1024;
+/// Checked before `serde_json::from_str`, which is the only place it can be: parsing
+/// allocates the whole `Value` tree first, so a per-field bound on `ciphertext` would
+/// fire long after the cost was paid. One guard at the entrance covers every field.
+///
+/// Real files are ~400 bytes (v1) and ~500 (v3, with geth's `address` and `id`), so
+/// 64 KiB is two orders of magnitude of headroom for pretty-printing and extra
+/// metadata while keeping the parse cost negligible. Without it the `# Cost` bounds
+/// below hold only for the small files they name: a 200 MB `ciphertext` allocates the
+/// input, the `Value`, and the decoded bytes, none of which the scrypt ceilings touch.
+const MAX_KEYSTORE_BYTES: usize = 64 << 10;
 
-fn validate_scrypt_resource_params(n: u32, r: u32, p: u32, dklen: usize) -> Result<()> {
-    let _log_n = scrypt_log_n(n)?;
-    if !(1..=SCRYPT_R_MAX).contains(&r) {
+/// Reject an oversized keystore before parsing it.
+fn check_size(keystore_json: &str) -> Result<()> {
+    if keystore_json.len() > MAX_KEYSTORE_BYTES {
         return Err(KmsError::DeserializationError(format!(
-            "kdfparams.r={r} outside allowed range 1..={SCRYPT_R_MAX}"
-        )));
-    }
-    if !(1..=SCRYPT_P_MAX).contains(&p) {
-        return Err(KmsError::DeserializationError(format!(
-            "kdfparams.p={p} outside allowed range 1..={SCRYPT_P_MAX}"
-        )));
-    }
-    if !(SCRYPT_DKLEN_MIN..=SCRYPT_DKLEN_MAX).contains(&dklen) {
-        return Err(KmsError::DeserializationError(format!(
-            "kdfparams.dklen={dklen} outside allowed range {SCRYPT_DKLEN_MIN}..={SCRYPT_DKLEN_MAX}"
-        )));
-    }
-    // scrypt memory ≈ 128 * N * r
-    let memory = (n as u64).saturating_mul(r as u64).saturating_mul(128);
-    if memory > SCRYPT_MEMORY_CEILING_BYTES {
-        return Err(KmsError::DeserializationError(format!(
-            "scrypt params request ~{memory} bytes of memory (ceiling {SCRYPT_MEMORY_CEILING_BYTES})"
+            "Keystore too large: {} bytes, limit is {MAX_KEYSTORE_BYTES}",
+            keystore_json.len()
         )));
     }
     Ok(())
@@ -105,13 +74,15 @@ fn validate_scrypt_resource_params(n: u32, r: u32, p: u32, dklen: usize) -> Resu
 /// # Arguments
 /// * `mnemonic` - The mnemonic phrase to encrypt
 /// * `password` - User-supplied password
-/// * `scrypt_n` - Scrypt cost parameter N (must be a power of 2)
+/// * `scrypt_n` - Scrypt cost parameter N: a power of two from 2 to 262144 (2^18,
+///   geth's standard strength). Larger is refused, not written.
 pub fn encrypt_keystore(mnemonic: &str, password: &str, scrypt_n: u32) -> Result<String> {
     // Generate 16-byte salt
     let salt = krusty_kms_crypto::random_bytes::<16>();
 
     // Derive encryption key
-    let key = derive_scrypt_key(password.as_bytes(), &salt, scrypt_n)?;
+    let key =
+        derive_scrypt_key(password.as_bytes(), &salt, scrypt_n.into()).map_err(caller_param)?;
 
     // Encrypt mnemonic bytes
     let payload = encrypt_with_key(mnemonic.as_bytes(), &key)?;
@@ -129,7 +100,7 @@ pub fn encrypt_keystore(mnemonic: &str, password: &str, scrypt_n: u32) -> Result
                 "dklen": 32,
                 "salt": hex::encode(salt),
             },
-            "nonce": hex::encode(&payload.nonce),
+            "nonce": hex::encode(payload.nonce),
             "ciphertext": hex::encode(&payload.ciphertext),
         }
     });
@@ -143,7 +114,16 @@ pub fn encrypt_keystore(mnemonic: &str, password: &str, scrypt_n: u32) -> Result
 /// # Arguments
 /// * `keystore_json` - JSON keystore string produced by [`encrypt_keystore`]
 /// * `password` - The password used during encryption
+///
+/// # Cost
+/// The KDF parameters come from the file, so a caller that accepts keystores from
+/// untrusted sources must rate-limit this. Rejection is cheap, but everything the
+/// ceilings admit is not: worst case is ~2 s of CPU and ~264 MiB of allocation. The
+/// input itself is capped at `MAX_KEYSTORE_BYTES`, so that is the whole cost -- the
+/// ceilings live in `encryption::scrypt_params`.
 pub fn decrypt_keystore(keystore_json: &str, password: &str) -> Result<String> {
+    check_size(keystore_json)?;
+
     let v: serde_json::Value = serde_json::from_str(keystore_json)
         .map_err(|e| KmsError::DeserializationError(format!("Invalid keystore JSON: {e}")))?;
 
@@ -158,14 +138,18 @@ pub fn decrypt_keystore(keystore_json: &str, password: &str) -> Result<String> {
 
     let crypto = &v["crypto"];
 
+    let kdfparams = &crypto["kdfparams"];
+
     let salt = hex::decode(
-        crypto["kdfparams"]["salt"]
+        kdfparams["salt"]
             .as_str()
             .ok_or_else(|| KmsError::DeserializationError("Missing salt".to_string()))?,
     )
     .map_err(|e| KmsError::DeserializationError(format!("Invalid salt hex: {e}")))?;
 
-    let n = parse_u32_kdf_param(crypto["kdfparams"]["n"].as_u64(), "n")?;
+    let n = kdfparams["n"]
+        .as_u64()
+        .ok_or_else(|| KmsError::DeserializationError("Missing kdfparams.n".to_string()))?;
 
     let nonce = hex::decode(
         crypto["nonce"]
@@ -181,7 +165,8 @@ pub fn decrypt_keystore(keystore_json: &str, password: &str) -> Result<String> {
     )
     .map_err(|e| KmsError::DeserializationError(format!("Invalid ciphertext hex: {e}")))?;
 
-    // Validate before deriving, so a malformed nonce costs no KDF work.
+    // Validated before deriving, so a malformed nonce costs nothing rather than ~2 s
+    // of scrypt first.
     xnonce(&nonce)?;
 
     let key = derive_scrypt_key(password.as_bytes(), &salt, n)?;
@@ -220,7 +205,16 @@ pub fn decrypt_keystore(keystore_json: &str, password: &str) -> Result<String> {
 ///
 /// # Returns
 /// The decrypted content as a hex-encoded string (typically a private key).
+///
+/// # Cost
+/// The KDF parameters come from the file, so a caller that accepts keystores from
+/// untrusted sources must rate-limit this. Rejection is cheap, but everything the
+/// ceilings admit is not: worst case is ~2 s of CPU and ~264 MiB of allocation. The
+/// input itself is capped at `MAX_KEYSTORE_BYTES`, so that is the whole cost -- the
+/// ceilings live in `encryption::scrypt_params`.
 pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<String> {
+    check_size(keystore_json)?;
+
     let v: serde_json::Value = serde_json::from_str(keystore_json)
         .map_err(|e| KmsError::DeserializationError(format!("Invalid keystore JSON: {e}")))?;
 
@@ -245,22 +239,39 @@ pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<St
     }
 
     // Parse kdfparams
+    let kdfparams = &crypto["kdfparams"];
+
     let salt = hex::decode(
-        crypto["kdfparams"]["salt"]
+        kdfparams["salt"]
             .as_str()
             .ok_or_else(|| KmsError::DeserializationError("Missing salt".to_string()))?,
     )
     .map_err(|e| KmsError::DeserializationError(format!("Invalid salt hex: {e}")))?;
 
-    let n = parse_u32_kdf_param(crypto["kdfparams"]["n"].as_u64(), "n")?;
+    let n = kdfparams["n"]
+        .as_u64()
+        .ok_or_else(|| KmsError::DeserializationError("Missing kdfparams.n".to_string()))?;
 
-    let r = parse_u32_kdf_param(crypto["kdfparams"]["r"].as_u64(), "r")?;
+    let r = kdfparams["r"]
+        .as_u64()
+        .ok_or_else(|| KmsError::DeserializationError("Missing kdfparams.r".to_string()))?;
 
-    let p = parse_u32_kdf_param(crypto["kdfparams"]["p"].as_u64(), "p")?;
+    let p = kdfparams["p"]
+        .as_u64()
+        .ok_or_else(|| KmsError::DeserializationError("Missing kdfparams.p".to_string()))?;
 
-    let dklen = parse_usize_kdf_param(crypto["kdfparams"]["dklen"].as_u64(), "dklen")?;
+    let dklen = kdfparams["dklen"]
+        .as_u64()
+        .ok_or_else(|| KmsError::DeserializationError("Missing kdfparams.dklen".to_string()))?;
 
-    validate_scrypt_resource_params(n, r, p, dklen)?;
+    // Below 32 puts the MAC key slice out of bounds; above 64 sizes an allocation
+    // from the file. Checked before narrowing, which turns 2^32 + 32 into 32.
+    if !(V3_DKLEN as u64..=V3_DKLEN_MAX).contains(&dklen) {
+        return Err(KmsError::DeserializationError(format!(
+            "Unsupported kdfparams.dklen: {dklen} (must be {V3_DKLEN}..={V3_DKLEN_MAX})"
+        )));
+    }
+    let dklen = dklen as usize;
 
     // Parse cipher params
     let iv =
@@ -283,8 +294,6 @@ pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<St
     )
     .map_err(|e| KmsError::DeserializationError(format!("Invalid mac hex: {e}")))?;
 
-    // `Aes128Ctr::new` converts the IV with `GenericArray::from_slice`, which asserts
-    // on a length mismatch. Checked here so a short IV errors instead of aborting.
     if iv.len() != V3_IV_LEN {
         return Err(KmsError::DeserializationError(format!(
             "Invalid cipherparams.iv length: expected {V3_IV_LEN} bytes, got {}",
@@ -292,33 +301,36 @@ pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<St
         )));
     }
 
-    // Derive key via scrypt (N/r/p already resource-capped above)
-    let log_n = scrypt_log_n(n)?;
-    let params = ScryptParams::new(log_n, r, p, dklen)
-        .map_err(|e| KmsError::CryptoError(format!("Invalid scrypt params: {e}")))?;
+    // Derive key via scrypt.
     let mut derived_key = Zeroizing::new(vec![0u8; dklen]);
-    scrypt(password.as_bytes(), &salt, &params, &mut derived_key)
-        .map_err(|e| KmsError::CryptoError(format!("Scrypt KDF failed: {e}")))?;
+    scrypt_derive(password.as_bytes(), &salt, n, r, p, &mut derived_key)?;
 
     let aes_key = &derived_key[..V3_DKLEN / 2];
     let mac_key = &derived_key[V3_DKLEN / 2..V3_DKLEN];
 
     // Verify MAC: Keccak256(mac_key || ciphertext). Streamed rather than concatenated
-    // to avoid a second copy of the MAC key in a plain `Vec` sized by the file.
+    // to avoid a second copy of the MAC key in a plain `Vec` sized by the file. Not a
+    // claim that no copy survives: Keccak256 absorbs `mac_key` into sponge state and
+    // implements neither `Zeroize` nor `ZeroizeOnDrop`, so those 16 bytes still reach
+    // freed memory. One un-scrubbed copy instead of two, and no file-sized allocation.
     let mut mac = Keccak256::new();
     mac.update(mac_key);
     mac.update(&ciphertext);
     let computed_mac = mac.finalize();
 
-    // Constant-time MAC compare to avoid password-oracle timing leaks.
-    if !bool::from(computed_mac.as_slice().ct_eq(expected_mac.as_slice())) {
+    // Constant-time: a `!=` on these leaks the expected MAC byte by byte to anyone
+    // who can submit keystores and time the call. `ct_eq` is 0 on a length mismatch.
+    if computed_mac.as_slice().ct_eq(&expected_mac).unwrap_u8() != 1 {
         return Err(KmsError::CryptoError(
             "MAC verification failed: wrong password or corrupted keystore".to_string(),
         ));
     }
 
-    // Decrypt with AES-128-CTR using the first 16 bytes of the derived key. `Zeroizing`
-    // because this buffer becomes the private key in place -- the higher-value secret.
+    // Decrypt with AES-128-CTR using the first 16 bytes of the derived key.
+    // `Zeroizing` because this buffer becomes the private key in place, and it is the
+    // higher-value secret of the two -- scrubbing the KDF output while leaving the key
+    // it protects in freed memory would be the wrong half. The returned `String` holds
+    // the same bytes and cannot be scrubbed without changing the signature.
     let mut plaintext = Zeroizing::new(std::mem::take(&mut ciphertext));
     let mut stream = Aes128Ctr::new(aes_key.into(), iv.as_slice().into());
     stream.apply_keystream(&mut plaintext);
@@ -329,6 +341,9 @@ pub fn decrypt_ethers_keystore(keystore_json: &str, password: &str) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Fixtures build keystores by hand, bypassing the validated constructor.
+    use crate::encryption::scrypt_params;
+    use scrypt::{scrypt, Params as ScryptParams};
 
     const TEST_SCRYPT_N: u32 = 1024;
 
@@ -368,7 +383,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // Malformed keystore metadata must not panic.
+    // malformed keystore metadata must not panic
 
     /// Build a v1 keystore with an arbitrary `nonce`, bypassing `encrypt_keystore`.
     fn keystore_v1_with_nonce_hex(nonce_hex: &str) -> String {
@@ -410,17 +425,82 @@ mod tests {
     #[test]
     fn decrypt_keystore_rejects_bad_nonce_length_without_panicking() {
         // 4 bytes instead of 24 used to hit an assert inside `generic-array`.
+        // Asserting on the message, not just `is_err`: the fixture's ciphertext fails
+        // the AEAD anyway, so `is_err` alone would still pass with `xnonce` deleted.
         for nonce_hex in ["", "deadbeef", &hex::encode([0u8; 25])] {
             let err = decrypt_keystore(&keystore_v1_with_nonce_hex(nonce_hex), &test_password(0))
                 .expect_err("must be rejected");
-            // The variant matters as much as the message: a wrong-length nonce is a
-            // property of the file, and `CryptoError` would tell a caller to retry the
-            // password. Same variant as every other malformed-field rejection here.
             assert!(
-                matches!(err, KmsError::DeserializationError(ref m) if m.contains("Invalid nonce length")),
-                "nonce {nonce_hex:?}, got {err:?}"
+                format!("{err}").contains("Invalid nonce length"),
+                "nonce {nonce_hex:?}, got {err}"
             );
         }
+    }
+
+    #[test]
+    fn oversized_keystore_is_rejected_unparsed() {
+        // Both formats. The padding sits in an unused field, so everything else about
+        // the file is valid and only the size can be what rejects it.
+        for (json, decrypt) in [
+            (
+                encrypt_keystore("m", &test_password(0), TEST_SCRYPT_N).unwrap(),
+                decrypt_keystore as fn(&str, &str) -> Result<String>,
+            ),
+            (valid_ethers_keystore(32), decrypt_ethers_keystore),
+        ] {
+            let mut ks: serde_json::Value = serde_json::from_str(&json).unwrap();
+            ks["padding"] = serde_json::json!("x".repeat(MAX_KEYSTORE_BYTES));
+            let err = decrypt(&ks.to_string(), &test_password(0)).expect_err("must be rejected");
+            assert!(format!("{err}").contains("Keystore too large"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn a_real_keystore_is_far_below_the_size_limit() {
+        // Guards against over-tightening: if a real file ever approaches the cap, this
+        // fails before the cap starts rejecting keystores in the field.
+        for json in [
+            encrypt_keystore("m", &test_password(0), TEST_SCRYPT_N).unwrap(),
+            valid_ethers_keystore(64),
+        ] {
+            assert!(
+                json.len() * 8 < MAX_KEYSTORE_BYTES,
+                "{} bytes leaves under 8x headroom",
+                json.len()
+            );
+        }
+    }
+
+    #[test]
+    fn caller_supplied_scrypt_n_is_an_invalid_parameter_not_a_bad_file() {
+        // The write path has no untrusted input to blame, so it must not report the
+        // caller's own bad argument as a deserialization failure.
+        let err = encrypt_keystore("m", &test_password(0), 1000).expect_err("must be rejected");
+        assert!(matches!(err, KmsError::InvalidParameter(_)), "got {err:?}");
+
+        // Read stays a deserialization error: there, `n` really did come from a file.
+        let keystore = encrypt_keystore("m", &test_password(0), TEST_SCRYPT_N).unwrap();
+        let mut ks: serde_json::Value = serde_json::from_str(&keystore).unwrap();
+        ks["crypto"]["kdfparams"]["n"] = serde_json::json!(1000);
+        let err =
+            decrypt_keystore(&ks.to_string(), &test_password(0)).expect_err("must be rejected");
+        assert!(
+            matches!(err, KmsError::DeserializationError(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_sourced_nonce_length_is_a_malformed_keystore_not_a_crypto_error() {
+        // `CryptoError` is what a wrong password returns, so reporting a bad nonce that
+        // way sends the caller round a password retry loop for a file that can never
+        // decrypt. Everything else read out of the file is a DeserializationError.
+        let err = decrypt_keystore(&keystore_v1_with_nonce_hex("deadbeef"), &test_password(0))
+            .expect_err("must be rejected");
+        assert!(
+            matches!(err, KmsError::DeserializationError(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -438,12 +518,30 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_ethers_keystore_accepts_oversized_dklen() {
+        // 33..=64 never panicked - the slices stay in bounds and the extra
+        // bytes are ignored, which is what geth and ethers do.
+        for dklen in [33u64, 48, 64] {
+            let err = decrypt_ethers_keystore(&ethers_keystore_with(dklen, 16), &test_password(0))
+                .expect_err("MAC must fail");
+            assert!(
+                format!("{err}").contains("MAC verification failed"),
+                "dklen={dklen}, got {err}"
+            );
+        }
+    }
+
+    #[test]
     fn decrypt_ethers_keystore_rejects_bad_iv_length_without_panicking() {
         // `Aes128Ctr::new` converts the IV with `GenericArray::from_slice`, which
         // asserts on a length mismatch. Asserting on the message, not just `is_err`,
         // so the case cannot pass for an unrelated reason.
         for iv_len in [0usize, 8, 15, 17, 32] {
-            let err = decrypt_ethers_keystore(&ethers_keystore_with(32, iv_len), &test_password(0))
+            let mut ks: serde_json::Value =
+                serde_json::from_str(&valid_ethers_keystore(32)).unwrap();
+            ks["crypto"]["cipherparams"]["iv"] =
+                serde_json::json!(hex::encode(vec![0xcdu8; iv_len]));
+            let err = decrypt_ethers_keystore(&ks.to_string(), &test_password(0))
                 .expect_err("must be rejected");
             assert!(
                 format!("{err}").contains("Invalid cipherparams.iv length"),
@@ -465,40 +563,31 @@ mod tests {
     }
 
     #[test]
-    fn decrypt_ethers_keystore_accepts_oversized_dklen() {
-        // 33..=64 never panicked -- the slices stay in bounds and the extra bytes
-        // are ignored, which is what geth and ethers do. Still accepted.
-        for dklen in [33u64, 48, 64] {
-            let err = decrypt_ethers_keystore(&ethers_keystore_with(dklen, 16), &test_password(0))
-                .expect_err("MAC must fail");
-            assert!(
-                format!("{err}").contains("MAC verification failed"),
-                "dklen={dklen}, got {err}"
-            );
-        }
+    fn decrypt_ethers_keystore_known_vector() {
+        let decrypted =
+            decrypt_ethers_keystore(&valid_ethers_keystore(32), &test_password(0)).unwrap();
+        assert_eq!(decrypted, KNOWN_PRIVATE_KEY);
     }
 
-    #[test]
-    fn decrypt_ethers_keystore_known_vector() {
-        // Build a test keystore by manually encrypting a known private key
-        // using the ethers.js format (AES-128-CTR + scrypt).
-        let private_key_bytes =
-            hex::decode("4c0883a69102937d6231471b5dbb6204fe512961708279f696ae35e0c2a1b5ce")
-                .unwrap();
+    const KNOWN_PRIVATE_KEY: &str =
+        "4c0883a69102937d6231471b5dbb6204fe512961708279f696ae35e0c2a1b5ce";
+
+    /// Build a valid v3 keystore holding [`KNOWN_PRIVATE_KEY`], for a given `dklen`.
+    fn valid_ethers_keystore(dklen: usize) -> String {
         let password = test_password(0);
         // Deterministic salt and IV for the test vector
         let salt = vec![0xab; 32];
         let iv = vec![0xcd; 16];
 
         // Derive key
-        let log_n = scrypt_log_n(TEST_SCRYPT_N).unwrap();
-        let params = ScryptParams::new(log_n, 8, 1, 32).unwrap();
-        let mut derived_key = vec![0u8; 32];
+        let log_n = (TEST_SCRYPT_N as f64).log2() as u8;
+        let params = ScryptParams::new(log_n, 8, 1, dklen).unwrap();
+        let mut derived_key = vec![0u8; dklen];
         scrypt(password.as_bytes(), &salt, &params, &mut derived_key).unwrap();
 
         // Encrypt with AES-128-CTR
         let aes_key = &derived_key[..16];
-        let mut ciphertext = private_key_bytes.clone();
+        let mut ciphertext = hex::decode(KNOWN_PRIVATE_KEY).unwrap();
         let mut cipher = Aes128Ctr::new(aes_key.into(), iv.as_slice().into());
         cipher.apply_keystream(&mut ciphertext);
 
@@ -508,8 +597,7 @@ mod tests {
         mac_input.extend_from_slice(&ciphertext);
         let mac = Keccak256::digest(&mac_input);
 
-        // Build keystore JSON
-        let keystore = serde_json::json!({
+        serde_json::json!({
             "version": 3,
             "crypto": {
                 "cipher": "aes-128-ctr",
@@ -518,7 +606,7 @@ mod tests {
                     "n": TEST_SCRYPT_N,
                     "r": 8,
                     "p": 1,
-                    "dklen": 32,
+                    "dklen": dklen,
                     "salt": hex::encode(&salt),
                 },
                 "cipherparams": {
@@ -527,16 +615,165 @@ mod tests {
                 "ciphertext": hex::encode(&ciphertext),
                 "mac": hex::encode(mac.as_slice()),
             }
-        });
+        })
+        .to_string()
+    }
 
-        let keystore_json = serde_json::to_string(&keystore).unwrap();
+    /// `n` values a newly written keystore must refuse.
+    const BAD_SCRYPT_N_ENCRYPT: [u32; 4] = [
+        1000,    // floored to 512
+        100_000, // floored to 65536, a weaker KDF
+        0,       // log2(0) is -inf
+        1,       // N=1 is a no-op KDF
+    ];
 
-        // Decrypt and verify
-        let decrypted = decrypt_ethers_keystore(&keystore_json, &password).unwrap();
-        assert_eq!(
-            decrypted,
-            "4c0883a69102937d6231471b5dbb6204fe512961708279f696ae35e0c2a1b5ce"
+    /// `n` values no keystore can legitimately hold, so reading must refuse them.
+    /// Both formats refuse the same set.
+    ///
+    /// `1 << 31` is the memory case: `ScryptParams::new(31, 8, 1, 32)` returns Ok
+    /// and scrypt then asks for 2 TiB, which aborts rather than erroring.
+    const BAD_SCRYPT_N_DECRYPT: [u64; 5] = [
+        0,                // log2(0) is undefined
+        1,                // N=1 is a no-op KDF
+        1 << 24,          // 16 GiB at r=8
+        1 << 31,          // 2 TiB at r=8
+        (1 << 32) + 1024, // truncated to 1024 by `as u32`
+    ];
+
+    #[test]
+    fn encrypt_keystore_rejects_non_power_of_two_n() {
+        // Strict here: flooring weakens the KDF the caller asked for.
+        for n in BAD_SCRYPT_N_ENCRYPT {
+            assert!(
+                encrypt_keystore("test mnemonic", &test_password(0), n).is_err(),
+                "n={n} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_keystore_rejects_non_power_of_two_n() {
+        // Reading is as strict as writing: flooring 1500 to 1024 would derive a key
+        // the file was never encrypted with and report it as a wrong password.
+        let keystore = encrypt_keystore("m", &test_password(0), TEST_SCRYPT_N).unwrap();
+        let mut ks: serde_json::Value = serde_json::from_str(&keystore).unwrap();
+        ks["crypto"]["kdfparams"]["n"] = serde_json::json!(1500);
+
+        let err =
+            decrypt_keystore(&ks.to_string(), &test_password(0)).expect_err("must be rejected");
+        assert!(
+            format!("{err}").contains("power of two"),
+            "should blame the params, not the password: {err}"
         );
+    }
+
+    #[test]
+    fn decrypt_keystore_rejects_unusable_n() {
+        for n in BAD_SCRYPT_N_DECRYPT {
+            let mut ks: serde_json::Value =
+                serde_json::from_str(&keystore_v1_with_nonce_hex(&hex::encode([0u8; 24]))).unwrap();
+            ks["crypto"]["kdfparams"]["n"] = serde_json::json!(n);
+            let err =
+                decrypt_keystore(&ks.to_string(), &test_password(0)).expect_err("must be rejected");
+            assert!(
+                matches!(err, KmsError::DeserializationError(_)),
+                "n={n}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_ethers_keystore_rejects_unusable_n() {
+        for n in BAD_SCRYPT_N_DECRYPT {
+            let mut ks: serde_json::Value =
+                serde_json::from_str(&valid_ethers_keystore(32)).unwrap();
+            ks["crypto"]["kdfparams"]["n"] = serde_json::json!(n);
+            let err = decrypt_ethers_keystore(&ks.to_string(), &test_password(0))
+                .expect_err("must be rejected");
+            assert!(
+                matches!(err, KmsError::DeserializationError(_)),
+                "n={n}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_ethers_keystore_rejects_out_of_range_dklen() {
+        // 2^32 + 32 narrows to an acceptable 32 on wasm32.
+        for dklen in [65u64, 128, 1 << 20, (1 << 32) + 32] {
+            let mut ks: serde_json::Value =
+                serde_json::from_str(&valid_ethers_keystore(32)).unwrap();
+            ks["crypto"]["kdfparams"]["dklen"] = serde_json::json!(dklen);
+            let err = decrypt_ethers_keystore(&ks.to_string(), &test_password(0))
+                .expect_err("must be rejected");
+            assert!(
+                matches!(err, KmsError::DeserializationError(_)),
+                "dklen={dklen}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_ethers_keystore_rejects_memory_bomb() {
+        // ~10 GiB, rejected before allocating. Weaken the guard and this test stops
+        // failing and starts hanging the machine.
+        let mut ks: serde_json::Value = serde_json::from_str(&valid_ethers_keystore(32)).unwrap();
+        ks["crypto"]["kdfparams"]["n"] = serde_json::json!(2);
+        ks["crypto"]["kdfparams"]["r"] = serde_json::json!(4_194_304);
+        ks["crypto"]["kdfparams"]["p"] = serde_json::json!(16);
+        let err = decrypt_ethers_keystore(&ks.to_string(), &test_password(0))
+            .expect_err("must be rejected");
+        assert!(matches!(err, KmsError::DeserializationError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn decrypt_ethers_keystore_reports_odd_n_as_a_params_error() {
+        // Flooring a corrupt `n` would derive a bogus key and blame the password.
+        let mut ks: serde_json::Value = serde_json::from_str(&valid_ethers_keystore(32)).unwrap();
+        ks["crypto"]["kdfparams"]["n"] = serde_json::json!(1500);
+        let err = decrypt_ethers_keystore(&ks.to_string(), &test_password(0))
+            .expect_err("must be rejected");
+        assert!(
+            format!("{err}").contains("power of two"),
+            "should blame the params, not the password: {err}"
+        );
+    }
+
+    #[test]
+    fn decrypt_ethers_keystore_rejects_unusable_r_and_p() {
+        // `r = 1000000` with n=2^20 passes `ScryptParams::new` and requests 125 TiB.
+        // `as u32` also truncated 2^32 + 8 to a valid-looking 8.
+        for (r, p) in [
+            (0u64, 1u64),
+            (1_000_000, 1),
+            ((1 << 32) + 8, 1),
+            (8, 0),
+            (8, 100_000),
+            (8, (1 << 32) + 1),
+        ] {
+            let mut ks: serde_json::Value =
+                serde_json::from_str(&valid_ethers_keystore(32)).unwrap();
+            ks["crypto"]["kdfparams"]["r"] = serde_json::json!(r);
+            ks["crypto"]["kdfparams"]["p"] = serde_json::json!(p);
+            let err = decrypt_ethers_keystore(&ks.to_string(), &test_password(0))
+                .expect_err("must be rejected");
+            assert!(
+                matches!(err, KmsError::DeserializationError(_)),
+                "r={r}, p={p}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_ethers_keystore_oversized_dklen_yields_the_same_key() {
+        // `dklen > 32` is accepted for geth/ethers compatibility, so it must
+        // decrypt *correctly*, not merely get past the length check: the tail
+        // beyond 32 bytes is ignored and the recovered key is unchanged.
+        for dklen in [33usize, 48, 64] {
+            let got = decrypt_ethers_keystore(&valid_ethers_keystore(dklen), &test_password(0))
+                .unwrap_or_else(|e| panic!("dklen={dklen} must decrypt, got {e}"));
+            assert_eq!(got, KNOWN_PRIVATE_KEY, "dklen={dklen} changed the key");
+        }
     }
 
     #[test]
@@ -546,7 +783,7 @@ mod tests {
         let iv = vec![0xcd; 16];
         let password = test_password(0);
 
-        let log_n = scrypt_log_n(TEST_SCRYPT_N).unwrap();
+        let log_n = (TEST_SCRYPT_N as f64).log2() as u8;
         let params = ScryptParams::new(log_n, 8, 1, 32).unwrap();
         let mut derived_key = vec![0u8; 32];
         scrypt(password.as_bytes(), &salt, &params, &mut derived_key).unwrap();
@@ -586,18 +823,26 @@ mod tests {
 
     #[test]
     fn decrypt_ethers_keystore_rejects_resource_exhausting_params() {
-        assert!(validate_scrypt_resource_params(TEST_SCRYPT_N, 8, 1, 32).is_ok());
-        assert!(validate_scrypt_resource_params(TEST_SCRYPT_N, SCRYPT_R_MAX + 1, 1, 32).is_err());
-        assert!(validate_scrypt_resource_params(TEST_SCRYPT_N, 8, SCRYPT_P_MAX + 1, 32).is_err());
-        assert!(
-            validate_scrypt_resource_params(TEST_SCRYPT_N, 8, 1, SCRYPT_DKLEN_MAX + 1).is_err()
-        );
-        // dklen < 32 must be rejected: decryption indexes derived_key[16..32].
-        assert!(
-            validate_scrypt_resource_params(TEST_SCRYPT_N, 8, 1, SCRYPT_DKLEN_MIN - 1).is_err()
-        );
-        // N=2^20 with r=32 exceeds the 256 MiB memory ceiling.
-        assert!(validate_scrypt_resource_params(1 << 20, 32, 1, 32).is_err());
+        // Carried over from `validate_scrypt_resource_params`, retargeted at the
+        // ceilings that replaced it. The dklen cases moved to the two tests below,
+        // which go through `decrypt_ethers_keystore` where that check now lives.
+        let n = u64::from(TEST_SCRYPT_N);
+        assert!(scrypt_params(n, 8, 1, 32).is_ok());
+
+        // The memory ceiling still refuses the case the flat caps were aimed at.
+        assert!(scrypt_params(1 << 20, 32, 1, 32).is_err());
+
+        // DELIBERATE RELAXATION. The flat `r <= 32` and `p <= 16` caps are gone,
+        // replaced by ceilings on what `r` and `p` actually cost. Web3 Secret Storage
+        // puts no bound on either, and at a small `N` a large one is cheap -- `r = 33`
+        // here is 4 MiB, which the flat cap refused for its shape rather than its cost.
+        assert!(scrypt_params(n, 33, 1, 32).is_ok());
+        assert!(scrypt_params(n, 8, 17, 32).is_ok());
+
+        // The same parameters priced out of range are still refused, which is what the
+        // flat caps were standing in for: `r` over the memory ceiling, `p` over work.
+        assert!(scrypt_params(n, 4096, 1, 32).is_err());
+        assert!(scrypt_params(1 << 20, 2, 16, 32).is_err());
     }
 
     fn ethers_keystore_with_dklen(dklen: u64) -> String {

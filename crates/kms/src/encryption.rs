@@ -58,38 +58,178 @@ pub struct EncryptedPayload {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Minimum allowed scrypt N (2^10).
-pub(crate) const SCRYPT_N_MIN: u32 = 1 << 10;
-/// Maximum allowed scrypt N (2^20).
-pub(crate) const SCRYPT_N_MAX: u32 = 1 << 20;
-
-/// Validate scrypt N and return `log2(N)` for [`ScryptParams`].
+/// Smallest scrypt `N` accepted, carried over from the audit hardening.
 ///
-/// Requires `N` to be a power of two in `[2^10, 2^20]`.
-pub(crate) fn scrypt_log_n(n: u32) -> Result<u8> {
-    if !(SCRYPT_N_MIN..=SCRYPT_N_MAX).contains(&n) || !n.is_power_of_two() {
-        return Err(KmsError::CryptoError(format!(
-            "Invalid scrypt N={n}: must be a power of 2 in [{SCRYPT_N_MIN}, {SCRYPT_N_MAX}]"
-        )));
+/// A floor on *strength*, where the ceilings below are a ceiling on *cost*; the two
+/// are independent and both are needed. `scrypt_log_n` folded into [`scrypt_params`]
+/// so there is one door rather than two, and this came with it: without the floor a
+/// caller could write a keystore at `N = 2`, which this crate already refused.
+pub(crate) const SCRYPT_N_MIN: u64 = 1 << 10;
+
+/// Largest scrypt `N` accepted, likewise carried over.
+///
+/// The memory ceiling below would admit more at a small `r`. This is the tighter of
+/// the two and is what a bare `N` is held to.
+pub(crate) const SCRYPT_N_MAX: u64 = 1 << 20;
+
+/// Memory ceiling for a scrypt derivation: `N` up to 2^18 at `r = 8`, geth's standard
+/// strength.
+///
+/// That case needs 268,437,504 bytes -- 2048 more than a round 256 MiB, since the
+/// total counts `p` and the temp buffer alongside `N` -- so the ceiling is the next
+/// round 8 MiB above it. The slack is not load-bearing; the next `N` up is twice this,
+/// not marginally over.
+///
+/// One ceiling for reading and writing, so "anything this build writes it can read
+/// again" holds by construction rather than by comparing two numbers. Not
+/// target-dependent either: a file one build accepts must not be a trap in another.
+const MAX_SCRYPT_MEM: u64 = 264 << 20;
+
+/// Cap on scrypt's work factor, `N * r * p`. The memory ceiling does not bound this:
+/// `{n: 2^22, r: 1, p: 2^22}` fits in 1 GiB and asks for ~10^13 block operations.
+///
+/// Eight times geth's heaviest standard setting (`N = 2^18` at `r = 8`). What that
+/// buys in `p` depends on `N`: 8 at geth's heaviest, 512 at `N = 2^12`, i.e. room
+/// for a large `p` exactly where a large `p` is cheap. Anything beyond hashes for
+/// hours, which is a denial of service whatever the memory use.
+const MAX_SCRYPT_WORK: u64 = 1 << 24;
+
+// Representability only -- whether the target can actually grow to the ceiling is
+// checked at runtime below, since that is not a compile-time property.
+const _: () = assert!(MAX_SCRYPT_MEM <= 1 << (usize::BITS - 1));
+
+/// Build [`ScryptParams`] from untrusted values - the only way to get them here.
+///
+/// Returns the projected allocation alongside them, for [`scrypt_derive`] to probe.
+/// Validation itself allocates nothing: the sizes under test here are exactly the
+/// ones that must never be allocated to find out they are too large.
+pub(crate) fn scrypt_params(n: u64, r: u64, p: u64, dklen: usize) -> Result<(ScryptParams, u64)> {
+    let bad = |why| {
+        KmsError::DeserializationError(format!(
+            "Unsupported scrypt params (n={n}, r={r}, p={p}): {why}"
+        ))
+    };
+
+    // Strength floor and ceiling, independent of the cost ceilings below: a weak `N`
+    // is cheap, so nothing further down would ever catch it.
+    if !(SCRYPT_N_MIN..=SCRYPT_N_MAX).contains(&n) {
+        return Err(bad("n must be in [2^10, 2^20]"));
     }
-    Ok(n.trailing_zeros() as u8)
+    // Exact, never floored: deriving with the nearest power of two below a corrupt `n`
+    // produces a bogus key and reports it as a wrong password.
+    if !n.is_power_of_two() {
+        return Err(bad("n must be a power of two"));
+    }
+    if r == 0 || p == 0 {
+        return Err(bad("r and p must be non-zero"));
+    }
+
+    // `n` is an exact power of two by here, so this round-trips and the arithmetic
+    // below can use `n` itself.
+    let log_n = n.ilog2() as u8;
+    let work = n.checked_mul(r).and_then(|w| w.checked_mul(p));
+    match work {
+        Some(w) if w <= MAX_SCRYPT_WORK => {}
+        _ => return Err(bad("exceeds the scrypt work ceiling")),
+    }
+
+    // scrypt 0.11 allocates `128*r*N` + `128*r*p` + `128*r`, so all three need
+    // bounding together: capping the first alone let `{n: 2, r: 2^22, p: 16}`
+    // through at 1 GiB while really asking ~10 GiB.
+    let total = 128u64
+        .checked_mul(r)
+        .and_then(|acc| acc.checked_mul(n + p + 1));
+    let bytes = match total {
+        Some(bytes) if bytes <= MAX_SCRYPT_MEM => bytes,
+        _ => return Err(bad("exceeds the scrypt memory ceiling")),
+    };
+
+    // Both casts are lossless: the work ceiling holds `r` and `p` under 2^24 each,
+    // since the other two factors are at least 1.
+    //
+    // `bad` rather than a `CryptoError`: scrypt's own rules -- `log_n < r * 16`, and
+    // `r * p < 2^30` -- reject file-supplied params just like the ceilings above, and
+    // that has to stay distinguishable from a wrong password. `InvalidParams` carries
+    // no detail beyond the values already in the message.
+    let params = ScryptParams::new(log_n, r as u32, p as u32, dklen)
+        .map_err(|_| bad("rejected by scrypt's own parameter rules"))?;
+    Ok((params, bytes))
 }
 
-/// Derive a 32-byte key from a password and salt using scrypt.
+/// Validate untrusted params, then derive into `out`.
+///
+/// The single door to [`scrypt`]: nothing else in the crate should call it, since
+/// the probe below is not optional on wasm32.
+pub(crate) fn scrypt_derive(
+    password: &[u8],
+    kdf_salt: &[u8],
+    n: u64,
+    r: u64,
+    p: u64,
+    out: &mut [u8],
+) -> Result<()> {
+    let (params, bytes) = scrypt_params(n, r, p, out.len())?;
+
+    // Under the ceiling is not the same as allocatable. scrypt allocates internally
+    // and an allocation failure aborts rather than unwinding, so on wasm32 -- where
+    // the ceiling is a large fraction of what an instance can grow to -- a permitted
+    // file would trap the module instead of erroring. Probing fallibly first keeps
+    // that a `Result` without making the ceiling target-dependent, which would turn a
+    // file one build accepts into a trap in another.
+    //
+    // Only the wasm32 case is load-bearing. Where the allocator overcommits, this
+    // succeeds without committing pages and the ceiling above is what bounds the
+    // damage; the probe is not a promise about hosts that overcommit and then OOM.
+    // Placed after `ScryptParams::new` so params it rejects -- `{n: 2^16, r: 1}`
+    // fails its `log_n < r * 16` rule -- cost no allocation at all.
+    //
+    // Three reservations held at once, matching scrypt's own `128*r*p`, `128*r*n` and
+    // `128*r`, rather than one block of their sum: the sum is not contiguous in scrypt
+    // and demanding that it be here would refuse a legitimate keystore on a fragmented
+    // heap -- a false rejection is a lost key, the failure this whole path avoids.
+    let probes: std::result::Result<Vec<Vec<u8>>, _> = [128 * r * p, 128 * r * n, 128 * r]
+        .into_iter()
+        .map(|size| {
+            let mut probe: Vec<u8> = Vec::new();
+            probe.try_reserve_exact(size as usize).map(|()| probe)
+        })
+        .collect();
+    probes.map_err(|_| {
+        KmsError::DeserializationError(format!(
+            "Unsupported scrypt params (n={n}, r={r}, p={p}): \
+             needs {bytes} bytes, more than this process can allocate"
+        ))
+    })?;
+
+    scrypt(password, kdf_salt, &params, out)
+        .map_err(|e| KmsError::CryptoError(format!("Scrypt KDF failed: {e}")))
+}
+
+/// Re-label a param rejection whose values came from a function argument.
+///
+/// [`scrypt_params`] reports every rejection as a [`KmsError::DeserializationError`],
+/// which is right for the paths that read `n` out of a keystore. The three that take
+/// `scrypt_n` as an argument have no input to blame, so they wrap this around it --
+/// cheaper than threading the distinction back through the KDF path, and it keeps
+/// `scrypt_params` with one story about its own errors.
+pub(crate) fn caller_param(err: KmsError) -> KmsError {
+    match err {
+        KmsError::DeserializationError(why) => KmsError::InvalidParameter(why),
+        other => other,
+    }
+}
+
+/// Derive a 32-byte key from a password and salt using scrypt (r=8, p=1).
 ///
 /// [`Zeroizing`] rather than a bare array: every caller has a `?` between the
 /// derivation and the end of the function, and a wrong password takes that path.
 pub(crate) fn derive_scrypt_key(
     password: &[u8],
     kdf_salt: &[u8],
-    n: u32,
+    n: u64,
 ) -> Result<Zeroizing<[u8; 32]>> {
-    let log_n = scrypt_log_n(n)?;
-    let params = ScryptParams::new(log_n, 8, 1, 32)
-        .map_err(|e| KmsError::CryptoError(format!("Invalid scrypt params: {e}")))?;
     let mut key = Zeroizing::new([u8::default(); 32]);
-    scrypt(password, kdf_salt, &params, &mut *key)
-        .map_err(|e| KmsError::CryptoError(format!("Scrypt KDF failed: {e}")))?;
+    scrypt_derive(password, kdf_salt, n, 8, 1, &mut *key)?;
     Ok(key)
 }
 
@@ -102,7 +242,9 @@ pub(crate) fn derive_scrypt_key(
 /// # Arguments
 /// * `private_key_hex` - Hex-encoded private key (with or without `0x` prefix)
 /// * `password` - User-supplied password
-/// * `scrypt_n` - Scrypt cost parameter N (must be a power of 2, e.g. 32768)
+/// * `scrypt_n` - Scrypt cost parameter N: a power of two from 2 to 262144 (2^18,
+///   geth's standard strength), e.g. 32768. Larger is refused here rather than
+///   written, since a file this build cannot read again is a lost key.
 ///
 /// # Returns
 /// An [`EncryptedKey`] containing the nonce, salt, and ciphertext.
@@ -111,21 +253,23 @@ pub fn encrypt_private_key(
     password: &str,
     scrypt_n: u32,
 ) -> Result<EncryptedKey> {
-    // Generate 16-byte salt
-    let salt = krusty_kms_crypto::random_bytes::<16>();
-
-    // Derive encryption key
-    let key = derive_scrypt_key(password.as_bytes(), &salt, scrypt_n)?;
-
-    // Generate 24-byte nonce
-    let nonce_bytes = krusty_kms_crypto::random_bytes::<XNONCE_LEN>();
-
-    // Decode hex private key
+    // Decode hex private key. Before the KDF, not after: a malformed argument should
+    // not cost a full derivation first -- up to ~2 s and 264 MiB at the ceiling.
     let hex_str = private_key_hex
         .strip_prefix("0x")
         .unwrap_or(private_key_hex);
     let plaintext =
         hex::decode(hex_str).map_err(|e| KmsError::CryptoError(format!("Invalid hex: {e}")))?;
+
+    // Generate 16-byte salt
+    let salt = krusty_kms_crypto::random_bytes::<16>();
+
+    // Derive encryption key
+    let key =
+        derive_scrypt_key(password.as_bytes(), &salt, scrypt_n.into()).map_err(caller_param)?;
+
+    // Generate 24-byte nonce
+    let nonce_bytes = krusty_kms_crypto::random_bytes::<XNONCE_LEN>();
 
     // Encrypt
     let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
@@ -159,12 +303,15 @@ pub fn decrypt_private_key(
     // Validate before deriving, so a malformed nonce costs no KDF work.
     let nonce = xnonce(&encrypted.nonce)?;
 
-    let key = derive_scrypt_key(password.as_bytes(), &encrypted.salt, scrypt_n)?;
+    // `scrypt_n` is an argument here too, not read from the payload.
+    let key = derive_scrypt_key(password.as_bytes(), &encrypted.salt, scrypt_n.into())
+        .map_err(caller_param)?;
 
     // Decrypt
     let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
         .map_err(|e| KmsError::CryptoError(format!("Invalid key: {e}")))?;
-    // The decrypted private key, scrubbed on drop like the key that unwrapped it.
+    // `Zeroizing` for the same reason as the derived key above: this buffer holds the
+    // raw private key, so leaving it in freed memory would scrub the wrong half.
     let plaintext = Zeroizing::new(
         cipher
             .decrypt(nonce, encrypted.encrypted_key.as_ref())
@@ -226,53 +373,79 @@ mod tests {
     // Use a low scrypt N for fast tests
     const TEST_SCRYPT_N: u32 = 1024;
 
-    // A nonce length must be validated, not asserted.
+    // `scrypt_params` only validates, never runs scrypt -- the only safe way to
+    // assert on sizes that would abort the process.
 
     #[test]
-    fn decrypt_with_key_rejects_wrong_nonce_length_without_panicking() {
-        // `XNonce::from_slice` asserts on a length mismatch, so a nonce taken
-        // from untrusted JSON used to abort the process instead of erroring.
-        let key = test_key(0);
-        for len in [0usize, 4, 23, 25, 64] {
-            let payload = EncryptedPayload {
-                nonce: vec![0u8; len],
-                ciphertext: vec![0u8; 48],
-            };
-            let err = decrypt_with_key(&payload, &key).expect_err("must be rejected");
-            assert!(
-                format!("{err}").contains("Invalid nonce length"),
-                "len={len}, got {err}"
-            );
-        }
+    fn scrypt_params_bounds_all_three_allocations() {
+        // scrypt allocates `128*r*N` + `128*r*p` + `128*r`, so the ceiling counts all
+        // three; capping the first alone used to let the rest through.
+        //
+        // These cases had to be retargeted when the `N >= 2^10` floor came in. They
+        // used to use `N = 2` so that `p` dominated the sum. With the floor, the work
+        // ceiling holds `r*p` under 2^14, so the `p` buffer can never exceed ~2 MiB --
+        // the pair below straddles the memory ceiling on exactly that margin. Both are
+        // far under the work ceiling and differ only in `p`.
+        assert!(scrypt_params(1024, 2100, 1, 32).is_ok());
+        assert!(scrypt_params(1024, 2100, 7, 32).is_err());
+
+        // `r` alone over the memory ceiling, still under the work ceiling.
+        assert!(scrypt_params(1024, 4096, 1, 32).is_err());
+
+        // And an `N` past its own ceiling, whatever `r` and `p` are.
+        assert!(scrypt_params(1 << 31, 1, 1, 32).is_err());
     }
 
     #[test]
-    fn decrypt_private_key_rejects_wrong_nonce_length_without_panicking() {
-        for len in [0usize, 4, 23, 25] {
-            let encrypted = EncryptedKey {
-                nonce: vec![0u8; len],
-                salt: vec![0u8; 16],
-                encrypted_key: vec![0u8; 48],
-            };
-            let err = decrypt_private_key(&encrypted, &test_password(0), TEST_SCRYPT_N)
-                .expect_err("must be rejected");
-            assert!(
-                format!("{err}").contains("Invalid nonce length"),
-                "len={len}, got {err}"
-            );
-        }
+    fn scrypt_params_bounds_work_the_memory_ceiling_misses() {
+        // Retargeted for the `N <= 2^20` ceiling: the old case used `N = 2^22`, which
+        // the ceiling now rejects first, so it would have passed without the work
+        // ceiling existing at all. `N` at its maximum with `p = 16` is 2^25 block
+        // operations in 256 MiB -- under the memory ceiling, so only the work ceiling
+        // catches it. `r = 2` rather than 1 because scrypt's own `log_n < r * 16` rule
+        // rejects `log_n = 20` at `r = 1`, which would be a third reason to fail.
+        assert!(scrypt_params(1 << 20, 2, 16, 32).is_err());
+        // The same shape one step down, to show it is the work ceiling that moved:
+        // 2^24 exactly, which is the limit rather than past it.
+        assert!(scrypt_params(1 << 20, 2, 8, 32).is_ok());
+
+        // A large `p` is valid under Web3 Secret Storage and cheap when `N` is small,
+        // so the work ceiling has to admit it -- the flat `p <= 16` cap did not.
+        assert!(scrypt_params(4096, 8, 32, 32).is_ok());
     }
 
     #[test]
-    fn correct_nonce_length_is_accepted() {
-        // Guards against over-tightening: a well-formed 24-byte nonce must
-        // still reach the AEAD and fail on authentication, not on length.
-        let payload = EncryptedPayload {
-            nonce: vec![0u8; XNONCE_LEN],
-            ciphertext: vec![0u8; 48],
-        };
-        let err = decrypt_with_key(&payload, &test_key(0)).expect_err("tag must fail");
-        assert!(format!("{err}").contains("Decryption failed"), "got {err}");
+    fn scrypt_params_admits_geth_standard_strength_and_no_more() {
+        // One ceiling for reading and writing, so every case here is both.
+        assert!(scrypt_params(1 << 17, 8, 1, 32).is_ok());
+
+        // geth's standard strength: the heaviest thing that fits.
+        assert!(scrypt_params(1 << 18, 8, 1, 32).is_ok());
+        assert!(scrypt_params(1 << 19, 8, 1, 32).is_err());
+        assert!(scrypt_params(1 << 20, 8, 1, 32).is_err());
+
+        // The memory ceiling still bites away from geth's `r = 8` shape, and this pins
+        // where. The old pair used `N = 2` for this, which the strength floor now
+        // rejects before the memory ceiling is consulted at all.
+        assert!(scrypt_params(1024, 2107, 1, 32).is_ok());
+        assert!(scrypt_params(1024, 2108, 1, 32).is_err());
+    }
+
+    #[test]
+    fn scrypt_params_rejects_non_power_of_two_n() {
+        // Never floored: 100_000 would derive with N=65536 and blame the password.
+        assert!(scrypt_params(100_000, 8, 1, 32).is_err());
+    }
+
+    #[test]
+    fn scrypt_params_rejects_before_any_allocation() {
+        // scrypt requires `log_n < r * 16`, so this fails validation despite passing
+        // both ceilings -- 8,388,864 bytes and 65,536 work units are well under. It
+        // matters where: with the probe inside `scrypt_params` a param error still
+        // reserved and freed the whole projection first, which is a free amplifier for
+        // anyone who can submit keystores -- and on wasm32 the heap never shrinks
+        // again. `scrypt_params` allocates nothing now; the probe is in `scrypt_derive`.
+        assert!(scrypt_params(1 << 16, 1, 1, 32).is_err());
     }
 
     fn test_password(offset: u8) -> String {
@@ -326,10 +499,13 @@ mod tests {
 
     #[test]
     fn reject_invalid_scrypt_n() {
-        assert!(scrypt_log_n(1023).is_err());
-        assert!(scrypt_log_n(3).is_err());
-        assert!(scrypt_log_n(1 << 21).is_err());
-        assert_eq!(scrypt_log_n(1024).unwrap(), 10);
+        // Carried over from the audit hardening and retargeted at `scrypt_params`,
+        // which `scrypt_log_n` folded into. Same bounds, same cases: the strength
+        // floor is not something the cost ceilings would ever have caught.
+        assert!(scrypt_params(1023, 8, 1, 32).is_err());
+        assert!(scrypt_params(3, 8, 1, 32).is_err());
+        assert!(scrypt_params(1 << 21, 8, 1, 32).is_err());
+        assert!(scrypt_params(1024, 8, 1, 32).is_ok());
     }
 
     #[test]
@@ -342,6 +518,55 @@ mod tests {
 
         let decrypted = decrypt_with_key(&payload, &key).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    // A nonce length must be validated, not asserted.
+
+    #[test]
+    fn decrypt_with_key_rejects_wrong_nonce_length_without_panicking() {
+        // `XNonce::from_slice` asserts on a length mismatch, so a nonce taken
+        // from untrusted JSON used to abort the process instead of erroring.
+        let key = test_key(0);
+        for len in [0usize, 4, 23, 25, 64] {
+            let payload = EncryptedPayload {
+                nonce: vec![0u8; len],
+                ciphertext: vec![0u8; 48],
+            };
+            let err = decrypt_with_key(&payload, &key).expect_err("must be rejected");
+            assert!(
+                format!("{err}").contains("Invalid nonce length"),
+                "len={len}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_private_key_rejects_wrong_nonce_length_without_panicking() {
+        for len in [0usize, 4, 23, 25] {
+            let encrypted = EncryptedKey {
+                nonce: vec![0u8; len],
+                salt: vec![0u8; 16],
+                encrypted_key: vec![0u8; 48],
+            };
+            let err = decrypt_private_key(&encrypted, &test_password(0), TEST_SCRYPT_N)
+                .expect_err("must be rejected");
+            assert!(
+                format!("{err}").contains("Invalid nonce length"),
+                "len={len}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn correct_nonce_length_is_accepted() {
+        // Guards against over-tightening: a well-formed 24-byte nonce must
+        // still reach the AEAD and fail on authentication, not on length.
+        let payload = EncryptedPayload {
+            nonce: vec![0u8; XNONCE_LEN],
+            ciphertext: vec![0u8; 48],
+        };
+        let err = decrypt_with_key(&payload, &test_key(0)).expect_err("tag must fail");
+        assert!(format!("{err}").contains("Decryption failed"), "got {err}");
     }
 
     #[test]

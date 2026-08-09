@@ -40,7 +40,8 @@ pub struct WasmEncryptedPayload {
 ///
 /// @param privateKeyHex - Private key in hex (with or without 0x prefix)
 /// @param password - Encryption password
-/// @param scryptN - Scrypt cost parameter N (power of 2, e.g. 32768)
+/// @param scryptN - Scrypt cost parameter N: a power of two from 2 to 262144
+///   (2^18), e.g. 32768. Anything larger throws.
 /// @returns Encrypted key with hex-encoded nonce, salt, and ciphertext
 #[wasm_bindgen(js_name = "encryptPrivateKey")]
 pub fn encrypt_private_key(
@@ -155,7 +156,8 @@ pub fn decrypt_with_key(nonce: &str, ciphertext: &str, key_hex: &str) -> Result<
 ///
 /// @param mnemonic - Mnemonic phrase to encrypt
 /// @param password - Encryption password
-/// @param scryptN - Scrypt cost parameter N (power of 2, e.g. 32768)
+/// @param scryptN - Scrypt cost parameter N: a power of two from 2 to 262144
+///   (2^18), e.g. 32768. Anything larger throws.
 /// @returns JSON keystore string
 #[wasm_bindgen(js_name = "encryptKeystore")]
 pub fn encrypt_keystore(mnemonic: &str, password: &str, scrypt_n: u32) -> Result<String, JsValue> {
@@ -165,6 +167,13 @@ pub fn encrypt_keystore(mnemonic: &str, password: &str, scrypt_n: u32) -> Result
 
 /// Decrypt a krusty-kms keystore (version 1) to recover the mnemonic.
 ///
+///
+/// The KDF parameters come from the file, so rate-limit this if the keystores are
+/// untrusted: the accepted range tops out around 2 s of CPU and 264 MiB of memory,
+/// which in a browser tab means a frozen UI or a failed alloc. Inputs over 64 KiB are
+/// rejected before parsing -- but wasm-bindgen has already copied the JS string into
+/// linear memory by then, and that memory is never returned to the host, so bounding
+/// the string on the JS side is still the caller's job.
 /// @param keystoreJson - JSON keystore string
 /// @param password - The password used during encryption
 /// @returns Decrypted mnemonic phrase
@@ -176,6 +185,13 @@ pub fn decrypt_keystore(keystore_json: &str, password: &str) -> Result<String, J
 
 /// Decrypt an ethers.js / Web3 Secret Storage keystore (version 3, scrypt KDF).
 ///
+///
+/// The KDF parameters come from the file, so rate-limit this if the keystores are
+/// untrusted: the accepted range tops out around 2 s of CPU and 264 MiB of memory,
+/// which in a browser tab means a frozen UI or a failed alloc. Inputs over 64 KiB are
+/// rejected before parsing -- but wasm-bindgen has already copied the JS string into
+/// linear memory by then, and that memory is never returned to the host, so bounding
+/// the string on the JS side is still the caller's job.
 /// @param keystoreJson - JSON keystore string in ethers.js format
 /// @param password - The password used during encryption
 /// @returns Decrypted content as hex string (typically a private key)
