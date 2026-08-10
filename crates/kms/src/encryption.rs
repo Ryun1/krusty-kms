@@ -528,7 +528,11 @@ mod tests {
         // `XNonce::from_slice` asserts on a length mismatch, so a nonce taken from
         // untrusted JSON used to abort the process instead of erroring. It cannot
         // reach that call any more; this is where it stops.
-        for len in [0usize, 4, 23, 25, 64] {
+        //
+        // 12 is the ChaCha20-Poly1305 nonce length, i.e. the plausible wrong answer
+        // rather than an arbitrary one. Carried over from #45, which added it to the
+        // per-call-site tests this replaces.
+        for len in [0usize, 4, 12, 23, 25, 64] {
             let err = xnonce(&vec![0u8; len]).expect_err("must be rejected");
             assert!(
                 matches!(err, KmsError::DeserializationError(_)),

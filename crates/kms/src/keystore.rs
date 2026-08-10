@@ -804,11 +804,11 @@ mod tests {
             ("dklen", serde_json::json!(true)),
         ];
         for (field, value) in cases {
-            let keystore = encrypt_keystore("m", "password1234", TEST_SCRYPT_N).unwrap();
+            let keystore = encrypt_keystore("m", &test_password(0), TEST_SCRYPT_N).unwrap();
             let mut ks: serde_json::Value = serde_json::from_str(&keystore).unwrap();
             ks["crypto"]["kdfparams"][field] = value.clone();
             let err =
-                decrypt_keystore(&ks.to_string(), "password1234").expect_err("must be rejected");
+                decrypt_keystore(&ks.to_string(), &test_password(0)).expect_err("must be rejected");
             assert!(
                 format!("{err}").contains(&format!("kdfparams.{field}")),
                 "{field}={value}, got {err}"
@@ -822,11 +822,11 @@ mod tests {
         // so a file naming anything else fails in the AEAD and reads as a wrong
         // password. Same failure the kdfparams check above exists to prevent.
         for (field, value) in [("kdf", "pbkdf2"), ("cipher", "aes-128-ctr")] {
-            let keystore = encrypt_keystore("m", "password1234", TEST_SCRYPT_N).unwrap();
+            let keystore = encrypt_keystore("m", &test_password(0), TEST_SCRYPT_N).unwrap();
             let mut ks: serde_json::Value = serde_json::from_str(&keystore).unwrap();
             ks["crypto"][field] = serde_json::json!(value);
             let err =
-                decrypt_keystore(&ks.to_string(), "password1234").expect_err("must be rejected");
+                decrypt_keystore(&ks.to_string(), &test_password(0)).expect_err("must be rejected");
             assert!(
                 format!("{err}").contains(&format!("Unsupported {field}")),
                 "{field}={value}, got {err}"
@@ -839,11 +839,11 @@ mod tests {
         // Absence is a rejection, not a default: `encrypt_keystore` has always written
         // both, so a file missing one is not a v1 keystore.
         for field in ["kdf", "cipher"] {
-            let keystore = encrypt_keystore("m", "password1234", TEST_SCRYPT_N).unwrap();
+            let keystore = encrypt_keystore("m", &test_password(0), TEST_SCRYPT_N).unwrap();
             let mut ks: serde_json::Value = serde_json::from_str(&keystore).unwrap();
             ks["crypto"].as_object_mut().unwrap().remove(field);
             let err =
-                decrypt_keystore(&ks.to_string(), "password1234").expect_err("must be rejected");
+                decrypt_keystore(&ks.to_string(), &test_password(0)).expect_err("must be rejected");
             assert!(
                 format!("{err}").contains(&format!("Unsupported {field}")),
                 "absent {field}, got {err}"
@@ -854,14 +854,14 @@ mod tests {
     #[test]
     fn decrypt_keystore_requires_kdfparams() {
         for field in ["r", "p", "dklen"] {
-            let keystore = encrypt_keystore("m", "password1234", TEST_SCRYPT_N).unwrap();
+            let keystore = encrypt_keystore("m", &test_password(0), TEST_SCRYPT_N).unwrap();
             let mut ks: serde_json::Value = serde_json::from_str(&keystore).unwrap();
             ks["crypto"]["kdfparams"]
                 .as_object_mut()
                 .unwrap()
                 .remove(field);
             let err =
-                decrypt_keystore(&ks.to_string(), "password1234").expect_err("must be rejected");
+                decrypt_keystore(&ks.to_string(), &test_password(0)).expect_err("must be rejected");
             assert!(
                 format!("{err}").contains(&format!("kdfparams.{field}")),
                 "absent {field}, got {err}"
