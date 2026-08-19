@@ -4,6 +4,15 @@ All notable changes to the published Rust crates are documented here.
 
 ## [Unreleased]
 
+### Security
+
+- Redact the private key from `TongoKeyPair` string conversions in the Dart,
+  JVM, and Swift bindings, matching the redacting `Debug` impls in Rust and
+  WASM. Swift's `NostrKeyPair` is redacted too; it previously leaked through
+  default struct reflection. The `check-secret-hygiene.sh` guardrail now pins
+  the redaction in every binding, not just Rust, so a new binding cannot drop
+  it silently.
+
 ## [0.7.0] - 2026-08-16
 
 ### Security

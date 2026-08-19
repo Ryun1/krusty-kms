@@ -29,6 +29,6 @@ public final class TongoKeyPair {
 
     @Override
     public String toString() {
-        return "TongoKeyPair(privateKey=" + privateKey + ", publicKey=" + publicKey + ")";
+        return "TongoKeyPair(privateKey=***, publicKey=" + publicKey + ")";
     }
 }

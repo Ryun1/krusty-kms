@@ -89,6 +89,24 @@ public struct NostrKeyPair: Equatable {
     }
 }
 
+// Without an explicit `description`, default struct reflection prints all 32
+// bytes of the private key — the leak the Rust `Debug` impls exist to prevent.
+// One conformance covers `String(reflecting:)` too, which falls back to
+// `description`. `Mirror`/`dump` still see the public stored properties.
+// NOTE: pinned by grep in .github/scripts/check-secret-hygiene.sh, not a test —
+// `swift test` needs a .testTarget plus libkms on the link line.
+extension TongoKeyPair: CustomStringConvertible {
+    public var description: String {
+        "TongoKeyPair(privateKey: ***, publicKey: \(publicKey))"
+    }
+}
+
+extension NostrKeyPair: CustomStringConvertible {
+    public var description: String {
+        "NostrKeyPair(privateKey: ***, publicKeyXOnly: \(publicKeyXOnly))"
+    }
+}
+
 public struct AccountHandle: Equatable {
     public let rawValue: UInt64
 

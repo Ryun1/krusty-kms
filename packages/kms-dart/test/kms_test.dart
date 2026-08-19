@@ -108,6 +108,18 @@ void main() {
     });
   });
 
+  group('TongoKeyPair', () {
+    // toString() fires implicitly from interpolation, exception messages and
+    // crash reporters, so the private key must never appear in it.
+    test('toString redacts the private key', () {
+      final priv = Felt.fromHex('0xdeadbeef');
+      final zero = Felt(Uint8List(32));
+      final kp = TongoKeyPair(priv, ProjectivePoint(zero, zero, zero));
+      expect(kp.toString(), isNot(contains('deadbeef')));
+      expect(kp.toString(), contains('***'));
+    });
+  });
+
   group('NostrKeyPair', () {
     test('stores copies', () {
       final priv = Uint8List(32);
@@ -117,6 +129,13 @@ void main() {
       final kp = NostrKeyPair(priv, pub);
       priv[0] = 0x00; // mutate original
       expect(kp.privateKey[0], equals(0xff)); // copy is untouched
+    });
+
+    test('toString redacts the private key', () {
+      final priv = Uint8List(32)..[0] = 0xff;
+      final kp = NostrKeyPair(priv, Uint8List(32));
+      expect(kp.toString(), isNot(contains('255')));
+      expect(kp.toString(), contains('[32 bytes]'));
     });
   });
 

@@ -122,7 +122,7 @@ class TongoKeyPair {
   int get hashCode => Object.hash(privateKey, publicKey);
 
   @override
-  String toString() => 'TongoKeyPair(privateKey: $privateKey, publicKey: $publicKey)';
+  String toString() => 'TongoKeyPair(privateKey: ***, publicKey: $publicKey)';
 }
 
 class NostrKeyPair {
