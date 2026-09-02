@@ -165,6 +165,14 @@ fn argent_unlisted_class_hash_is_rejected_even_with_override() {
         panic!("unknown Argent class hash must be rejected");
     };
     assert_eq!(err.code, GatewayErrorCode::InvalidClassHash);
+    assert!(
+        err.message
+            .as_deref()
+            .unwrap_or("")
+            .contains("does not apply to Argent"),
+        "unexpected message: {:?}",
+        err.message
+    );
 }
 
 #[test]
@@ -181,7 +189,11 @@ fn class_hash_allowlist_does_not_offer_the_override_for_argent() {
     assert_eq!(err.code, GatewayErrorCode::InvalidClassHash);
     let message = err.message.as_deref().unwrap_or("");
     assert!(
-        !message.contains("allow_unlisted_class_hash"),
-        "Argent rejection must not advertise the override: {message}"
+        !message.contains("allow_unlisted_class_hash=true to override"),
+        "Argent rejection must not suggest the override: {message}"
+    );
+    assert!(
+        message.contains("does not apply to Argent"),
+        "Argent rejection should say the override cannot help: {message}"
     );
 }

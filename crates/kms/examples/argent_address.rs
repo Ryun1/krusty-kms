@@ -21,7 +21,6 @@ use krusty_kms::{
     derive_argent_legacy_private_key, derive_private_key_with_coin_type, stark_public_key,
     AccountClass, ArgentAccount, SaltPolicy, STARKNET_COIN_TYPE,
 };
-use starknet_types_core::felt::Felt;
 
 fn main() -> Result<(), String> {
     let mnemonic = std::env::var("MNEMONIC")
@@ -54,16 +53,10 @@ fn main() -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
 
             println!("index {index} [{scheme}]  pubkey {public_key:#x}");
-            for (version, class_hash) in [
-                ("v0.4.0", ArgentAccount::CLASS_HASH),
-                ("v0.3.1", ArgentAccount::CLASS_HASH_V031),
-                ("v0.3.0", ArgentAccount::CLASS_HASH_V030),
-            ] {
-                let account = ArgentAccount::try_with_class_hash(
-                    Felt::from_hex(class_hash).map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| e.to_string())?;
-                let address = account
+            // Read the canonical table, so a newly supported class shows up
+            // here without anyone remembering to add it.
+            for (class_hash, version, layout) in ArgentAccount::known_classes() {
+                let address = ArgentAccount::with_class_hash_and_layout(class_hash, layout)
                     .calculate_address(&public_key, SaltPolicy::PublicKey)
                     .map_err(|e| e.to_string())?;
                 println!("    {version}  0x{address:064x}");

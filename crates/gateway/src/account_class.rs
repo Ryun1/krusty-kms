@@ -118,7 +118,11 @@ pub(crate) fn enforce_class_hash_allowlist(
     chain_id: ChainId,
     allow_unlisted: bool,
 ) -> GatewayResult<()> {
-    if allow_unlisted {
+    // Argent resolution needs a known constructor layout, which the override
+    // cannot supply, so the flag does not apply to Argent: reject here with a
+    // message that says so, rather than passing the gate and failing later.
+    let override_applies = !matches!(kind, AccountClassKind::Argent);
+    if allow_unlisted && override_applies {
         return Ok(());
     }
 
@@ -127,11 +131,11 @@ pub(crate) fn enforce_class_hash_allowlist(
         return Ok(());
     }
 
-    // Argent resolution needs a known constructor layout, so the override
-    // cannot unblock an unlisted Argent class; do not advertise it there.
-    let override_hint = match kind {
-        AccountClassKind::Argent => "",
-        _ => "; set allow_unlisted_class_hash=true to override",
+    let override_hint = if override_applies {
+        "; set allow_unlisted_class_hash=true to override"
+    } else {
+        "; allow_unlisted_class_hash does not apply to Argent, whose \
+         constructor calldata is version-specific"
     };
     Err(GatewayError::new(
         GatewayErrorCode::InvalidClassHash,

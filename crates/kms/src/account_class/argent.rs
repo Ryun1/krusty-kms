@@ -106,12 +106,16 @@ impl ArgentAccount {
             .map(|(_, _, layout)| layout)
     }
 
-    /// Latest supported Argent class (v0.4.0).
+    /// Latest supported Argent class.
+    ///
+    /// Taken from the head of [`Self::known_classes`], so the default class
+    /// hash and its layout cannot drift apart when a newer class is added.
     pub fn new() -> Self {
-        Self::with_class_hash_and_layout(
-            static_class_hash(Self::CLASS_HASH),
-            ArgentConstructorLayout::SignerWithOptionalGuardian,
-        )
+        let (class_hash, _, layout) = Self::known_classes()
+            .into_iter()
+            .next()
+            .expect("known_classes is never empty");
+        Self::with_class_hash_and_layout(class_hash, layout)
     }
 
     /// Create with a custom class hash.
@@ -197,6 +201,22 @@ mod tests {
             argent.constructor_layout(),
             ArgentConstructorLayout::SignerWithOptionalGuardian
         );
+    }
+
+    #[test]
+    fn test_argent_new_agrees_with_the_canonical_table() {
+        // The default preset must be a row of known_classes(), layout included:
+        // a hardcoded pairing here is how a future class silently derives an
+        // undeployable address on the most-used path.
+        let argent = ArgentAccount::new();
+        assert_eq!(
+            ArgentAccount::layout_for_class_hash(&argent.class_hash()),
+            Some(argent.constructor_layout())
+        );
+        let (head_hash, _, head_layout) =
+            ArgentAccount::known_classes().into_iter().next().unwrap();
+        assert_eq!(argent.class_hash(), head_hash);
+        assert_eq!(argent.constructor_layout(), head_layout);
     }
 
     #[test]
